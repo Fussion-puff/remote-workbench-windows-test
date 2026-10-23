@@ -2,6 +2,8 @@
 
 Remote Workbench 把 agent 和 MCP 控制进程留在本机，通过 SSH 在远端项目目录中执行工作。远端不需要安装 Codex CLI；需要能通过本机 SSH 连接，并提供 Python 3.9+。
 
+如果要同时维护源码开发版和独立的日常稳定版，请先看[本机开发版与稳定版部署](development.zh-CN.md)。
+
 ## 1. 在本机安装
 
 ```sh

@@ -6,6 +6,8 @@ This is an independently maintained derivative of [Onirika](https://github.com/x
 
 中文使用步骤见 [快速上手](docs/quickstart.zh-CN.md)。
 
+本机开发环境与日常稳定版的隔离、安装和切换方式见[开发与稳定版部署](docs/development.zh-CN.md)。
+
 ## Use a remote project as the default environment
 
 The recommended entry point, `remote-workbench-workspace`, binds one local MCP process to a host and an absolute remote project directory. Its tools omit the host parameter and resolve relative paths from that project root. Copy [workspace.example.json](workspace.example.json), then set `host` to an alias from your local SSH configuration and `cwd` to the remote project directory.
