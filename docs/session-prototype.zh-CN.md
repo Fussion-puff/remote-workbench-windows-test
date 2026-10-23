@@ -109,4 +109,28 @@ App 联调时，仅启用 develop 原型，在两个聊天中分别调用 `works
 remote-workbench-session --identity-probe --data-dir /absolute/path/to/develop/identity-data --viewer-port 8771
 ```
 
-此模式只暴露无参数的 `session_identity_probe`。它不读取主机配置、不建立 SSH、不创建或选择 Workspace，仅返回实际 MCP 请求中的身份是否可用及字段名，并保存本机记录。其他 metadata 的值不会写入记录。App 设置中出现服务器条目、或本机端口已启动，都不能代替真实的 tool call 验证；修改配置后，已开始回合的工具清单也可能仍需在后续回合刷新。
+此模式只暴露无参数的 `session_identity_probe`。它不读取主机配置、不建立 SSH、不创建或选择 Workspace，仅返回实际 MCP 请求中的身份是否可用及字段名，并保存本机记录。其他 metadata 的值不会写入记录。
+
+诊断用 MCP 配置示例：
+
+```toml
+[mcp_servers.remote-workbench-identity-probe]
+enabled = true
+required = true
+command = "/absolute/path/to/develop/.venv/bin/remote-workbench-session"
+args = ["--identity-probe", "--data-dir", "/absolute/path/to/develop/identity-data", "--viewer-port", "8771"]
+```
+
+诊断期间的 `required = true` 让支持该选项的客户端等待探针初始化完成。它不能刷新已经加载的工具列表，也不能补充缺失的 threadId。联调结束后可关闭此临时诊断项。
+
+### 设置中可见，但当前对话无法调用
+
+需要分别核对三个阶段：
+
+1. **服务已配置并启动**：设置中出现条目、进程运行、端口监听或启动日志报告 ready，只证明服务启动成功。
+2. **工具进入当前对话**：当前对话能发现并调用 `session_identity_probe`。新回合仍可能沿用先前的 MCP 连接，继续发送消息不保证刷新工具列表。
+3. **身份实际传入**：真实调用返回 `identity_available=true`，操作记录包含客户端传入的 threadId。只有这一阶段才能验证当前 App 的身份转发。
+
+第一阶段成功而第二阶段缺失时，按 [官方配置步骤](https://learn.chatgpt.com/docs/extend/mcp#configure-in-the-chatgpt-desktop-app)在保存设置后选择 Restart，再回到原对话检查。单独启动 CLI 或 Python MCP 客户端可以检查配置、协议和服务实现，但不能证明当前 App 对话已经获得工具或转发身份。
+
+App Server 的公开 `config/mcpServer/reload` 接口可为已加载对话排队刷新配置，但需要已有、受支持的服务连接。仅通过 stdio 启动的桌面实例不一定提供 CLI 可接入的控制端口；此时按 App 的重启流程处理。
