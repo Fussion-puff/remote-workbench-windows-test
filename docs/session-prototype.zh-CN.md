@@ -1,6 +1,6 @@
 # 按 Codex 对话路由的 Session 原型
 
-`remote-workbench-session` 从 `0.3.0a1` 起作为 develop 的可选入口，当前版本为 `0.3.0a3`。它复用原有 SSH、文件、Git 和后台任务工具，保留 `remote-workbench-workspace` 与 `remote-workbench-ssh`。安装到独立 wheel 环境的日常版不会随开发源码改变。
+`remote-workbench-session` 从 `0.3.0a1` 起作为 develop 的可选入口，当前版本为 `0.3.0a4`。它复用原有 SSH、文件、Git 和后台任务工具，保留 `remote-workbench-workspace` 与 `remote-workbench-ssh`。安装到独立 wheel 环境的日常版不会随开发源码改变。
 
 ## 身份和首次绑定
 
@@ -63,6 +63,10 @@ SQLite 使用 WAL 和事务，绑定更新检查 revision。审计记录附带 t
 ## 记录页与通信量
 
 每个返回结果继续包含加粗的 **Remote Workbench 操作记录** 链接。一个查看器通过 `/w/<workspace_uuid>/` 分别展示各工作区记录；未选择工作区的请求不会落入全局默认记录。通过一个工作区的 API 路径无法读取另一工作区的 operation ID。
+
+从 `0.3.0a4` 起，记录页开启“自动刷新”后每两秒更新列表和当前记录，并默认“跟随最新操作”。点选历史记录会取消跟随，列表与所选记录仍更新；重新勾选“跟随最新操作”即可回到最新记录。页面显示最近更新时间和刷新错误，手动“刷新”也会更新右侧内容。刷新会重新读取输出来源并补齐结束时的日志，已展开的原始输出同步更新。轮询只读取本机记录，不产生额外 MCP 调用或 SSH 查询，也不会跨工作区展示其他聊天的记录。
+
+HTML 由运行中的 MCP 或独立查看器进程提供。更新源码后，需要重启相应服务再刷新页面；只重载浏览器无法更新旧进程已经载入的 HTML。开发联调可以另开只读查看器读取同一记录目录，而无需替换日常版。
 
 MCP 结果为一份紧凑 JSON 文本，不重复发送 structuredContent。命令预览默认 2 KiB，文件、补丁和 Git diff 预览默认 4 KiB；完整内容仍保存在本机。通常无需把 SSH 包装代码读回模型上下文。记录页仍是本机 HTML，不会因远端 cwd 改变而自动成为 Codex 的原生终端或原生 Git diff。
 

@@ -26,6 +26,8 @@ git switch develop
 uv sync --locked --extra dev
 ```
 
+浏览器脚本的行为回归使用本机 Node.js 内置 VM，不需要安装 npm 依赖；本机缺少 Node 时 pytest 会跳过这组检查，CI 会先确认 Node 可用。Node 仅用于开发测试，运行 MCP 和远端执行仍使用原有 Python 环境。
+
 开发版使用独立的主机配置、workspace manifest 和审计根目录。manifest 的 `config` 字段要显式指向开发版配置；`cwd` 指向远端模板目录，工具首次调用时会在模板旁创建该进程 session 专用副本，测试不会直接修改模板。稳定版和开发版可分别绑定日常与测试模板。MCP 开发项使用 `--viewer-port 8769`，并设 `enabled = false`，需要测试时再临时启用。每次启动进程都会得到新的 session UUID，进程内的本机审计、输出和查看页各自独立。
 
 ## 稳定版安装

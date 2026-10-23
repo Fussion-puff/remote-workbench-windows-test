@@ -27,7 +27,7 @@ main{display:grid;grid-template-columns:minmax(250px,310px) minmax(0,1fr);height
 </style></head><body>
 <header><span class="brand-mark" aria-hidden="true"></span><h1>Remote Workbench 操作记录</h1><p>命令、输出和代码改动保存在本机，可直接查看完整记录。</p>
 <label class="live"><input id="live" type="checkbox"> 自动刷新</label></header>
-<main><aside class="sidebar"><div class="sidehead"><div class="sidehead-top"><h2>最近操作</h2><button class="button button-secondary" id="refresh" type="button">刷新</button></div><label class="filter"><input id="show-technical" type="checkbox"> 显示内部执行步骤</label></div><div class="records" id="records" aria-live="polite"></div></aside>
+<main><aside class="sidebar"><div class="sidehead"><div class="sidehead-top"><h2>最近操作</h2><button class="button button-secondary" id="refresh" type="button">刷新</button></div><label class="filter"><input id="follow-latest" type="checkbox" checked disabled> 跟随最新操作</label><label class="filter"><input id="show-technical" type="checkbox"> 显示内部执行步骤</label><div class="subtle" id="refresh-status" role="status" style="font-size:12px;margin-top:10px">自动刷新已关闭</div></div><div class="records" id="records" aria-live="polite"></div></aside>
 <section class="content" id="content"><div class="empty" id="empty"><div class="empty-inner"><div class="empty-icon" aria-hidden="true">⌘</div><strong>选择一项操作</strong><span>这里会显示实际命令、运行结果和代码改动。</span></div></div>
 <article class="operation" id="operation" hidden><div class="ophead"><div><h2 id="heading">操作详情</h2><div class="op-context" id="context-line"></div></div><div class="op-actions"><span class="status" id="state-pill"></span></div></div>
 <div class="summary-card" id="summary-card" hidden><div class="summary-title" id="summary-title"></div><div class="summary-detail" id="summary-detail"></div><div class="summary-files" id="summary-files"></div></div>
@@ -45,6 +45,7 @@ main{display:grid;grid-template-columns:minmax(250px,310px) minmax(0,1fr);height
   const TOOL_TITLES = {ssh_run:'运行命令',ssh_run_background:'启动后台任务',ssh_job_status:'查看后台任务',ssh_read_file:'读取文件',ssh_write_file:'修改文件',ssh_patch_file:'修改文件',ssh_append_file:'追加文件内容',ssh_insert_lines:'插入文件内容',ssh_replace_lines:'替换文件行',ssh_list_dir:'查看目录',ssh_file_info:'查看文件信息',ssh_mkdir:'创建目录',ssh_move:'移动文件',ssh_delete:'删除文件',ssh_download:'下载文件',ssh_grep:'搜索代码',ssh_find_files:'查找文件',ssh_git_status:'查看版本状态',ssh_git_diff:'查看代码改动',ssh_git_log:'查看提交记录',ssh_apply_patch:'应用代码补丁',ssh_check_connection:'检查连接'};
   const el = id => document.getElementById(id);
   let selected = '', activeStream = 'stdout', cursor = 0, rawCursor = 0, selectedRecord = null, polling = false, timer = null, diffState = {old:null,next:null,oldRemaining:0,nextRemaining:0,inHunk:false,pending:''};
+  let latestRecordId = '', streamPinned = false, outputPlaceholder = false, ready = false;
   const buttons = new Map();
   async function get(url) {
     const workspacePrefix = location.pathname.match(/^\/w\/[a-f0-9]{32}(?=\/)/);
@@ -111,6 +112,7 @@ main{display:grid;grid-template-columns:minmax(250px,310px) minmax(0,1fr);height
     const rows = await get('/api/records');
     const showTechnical = el('show-technical').checked;
     const visible = rows.filter(row => showTechnical || !row.parent_id);
+    latestRecordId = visible.length ? visible[0].id : '';
     const keep = new Set();
     const container = el('records');
     const selectedButton = buttons.get(selected);
@@ -122,7 +124,7 @@ main{display:grid;grid-template-columns:minmax(250px,310px) minmax(0,1fr);height
       let button = buttons.get(row.id);
       if (!button) {
         button = make('button','record'); button.type = 'button'; button.dataset.id = row.id;
-        button.addEventListener('click', () => selectRecord(row.id));
+        button.addEventListener('click', () => selectManualRecord(row.id));
         buttons.set(row.id, button);
       }
       button.replaceChildren();
@@ -143,6 +145,7 @@ main{display:grid;grid-template-columns:minmax(250px,310px) minmax(0,1fr);height
     } else if (selectedButton && buttons.has(selected)) {
       container.scrollTop = selectedButton.offsetTop - selectedOffset;
     }
+    return visible;
   }
   function setStatePill(record) {
     const info = stateInfo(record), node = el('state-pill');
@@ -193,6 +196,12 @@ main{display:grid;grid-template-columns:minmax(250px,310px) minmax(0,1fr);height
     const summary = view.summary || null;
     showSummary('summary',summary);
   }
+  function preferredStream(record) {
+    const sizes = record.stream_bytes || record.output_bytes || {};
+    if (Number(sizes.diff || 0) > 0 || record.arguments && record.arguments.mode === 'patch') return 'diff';
+    if (Number(sizes.stdout || 0) > 0) return 'stdout';
+    return Number(sizes.stderr || 0) > 0 ? 'stderr' : 'stdout';
+  }
   function renderStreams(record) {
     const root = el('streams'); root.replaceChildren();
     const counts = record.stream_bytes || record.output_bytes || {};
@@ -204,15 +213,15 @@ main{display:grid;grid-template-columns:minmax(250px,310px) minmax(0,1fr);height
     for (const name of extras) {
       const button = make('button','child',LABELS[name]); button.type = 'button';
       button.setAttribute('aria-pressed',String(activeStream === name));
-      button.addEventListener('click',()=>{activeStream=name;renderStreams(selectedRecord);loadOutput(true);if(el('raw-details').open)loadRaw(true);});
+      button.addEventListener('click',()=>{streamPinned=true;activeStream=name;renderStreams(selectedRecord);loadOutput(true);if(el('raw-details').open)loadRaw(true);});
       extraRoot.append(button);
     }
-    if (!available.includes(activeStream)) activeStream = available.includes('diff') ? 'diff' : Number(counts.stdout || 0) > 0 ? 'stdout' : Number(counts.stderr || 0) > 0 ? 'stderr' : 'stdout';
+    if (!available.includes(activeStream) && !extras.includes(activeStream)) activeStream = preferredStream(record);
     for (const name of available) {
       const button = make('button','stream',LABELS[name] || name); button.type = 'button';
       button.setAttribute('role','tab'); button.setAttribute('aria-selected',String(activeStream === name));
       button.setAttribute('aria-pressed', String(activeStream === name));
-      button.addEventListener('click', () => { activeStream = name; renderStreams(selectedRecord); loadOutput(true); if (el('raw-details').open) loadRaw(true); });
+      button.addEventListener('click', () => { streamPinned = true; activeStream = name; renderStreams(selectedRecord); loadOutput(true); if (el('raw-details').open) loadRaw(true); });
       root.append(button);
     }
     el('output-heading').textContent = activeStream === 'diff' ? '代码改动' : activeStream === 'stderr' ? '运行日志' : activeStream === 'stdin' ? '输入内容' : '运行输出';
@@ -272,6 +281,7 @@ main{display:grid;grid-template-columns:minmax(250px,310px) minmax(0,1fr);height
     if (!out.childNodes.length) out.classList.add('empty-output'); else out.classList.remove('empty-output');
   }
   function renderContent(content, append=false, hasMore=false) {
+    if (outputPlaceholder) { append = false; outputPlaceholder = false; }
     if (activeStream === 'diff') renderDiff(content, append, hasMore);
     else {
       const out = el('output');
@@ -288,36 +298,39 @@ main{display:grid;grid-template-columns:minmax(250px,310px) minmax(0,1fr);height
     return stream === 'diff' ? '无改动' : '（当前没有这类输出）';
   }
   async function loadOutput(reset, append=false) {
-    if (!selected) return;
+    if (!selected) return true;
     if (reset) { cursor = 0; renderContent('', false); showSummary('output',null); }
     const requestId = selected, requestStream = activeStream, sourceStream = outputSourceStream(activeStream), requestCursor = cursor;
+    const sourceId = selectedRecord && selectedRecord.output_source_id || requestId;
     el('message').textContent = '';
     try {
-      const sourceId = selectedRecord && selectedRecord.output_source_id || requestId;
       const value = await get('/api/output?id='+encodeURIComponent(sourceId)+'&stream='+encodeURIComponent(sourceStream)+'&cursor='+requestCursor);
-      if (selected !== requestId || activeStream !== requestStream || cursor !== requestCursor) return;
+      if (selected !== requestId || activeStream !== requestStream || cursor !== requestCursor || (selectedRecord && selectedRecord.output_source_id || selected) !== sourceId) return true;
       renderContent(value.content, append || requestCursor > 0, value.truncated);
       cursor = value.next_cursor;
       if (value.summary) showSummary('output',value.summary);
       el('next').disabled = !value.truncated;
       el('output-meta').textContent = value.total_bytes.toLocaleString() + ' 字节' + (value.truncated ? ' · 尚有后续内容' : ' · 已显示完整内容');
-      if (!value.total_bytes && !el('output').textContent) el('output').textContent = emptyOutputText(requestStream);
+      if (!value.total_bytes && !el('output').textContent) { el('output').textContent = emptyOutputText(requestStream); outputPlaceholder = true; }
+      return true;
     } catch (error) {
-      if (selected !== requestId || activeStream !== requestStream) return;
+      if (selected !== requestId || activeStream !== requestStream) return true;
       const missingOutput = /not found|no such file or directory/i.test(error.message);
-      el('output').textContent = missingOutput ? emptyOutputText(requestStream) : '（当前没有这类输出）';
+      if (missingOutput) { el('output').textContent = emptyOutputText(requestStream); outputPlaceholder = true; }
       el('next').disabled = true; el('output-meta').textContent = '';
       if (!missingOutput) el('message').textContent = error.message;
+      return missingOutput;
     }
   }
   async function loadRaw(reset=false) {
     if (!selected) return;
     if (reset) { rawCursor = 0; el('raw-output').textContent = ''; }
-    const requestId = selected, requestCursor = rawCursor, stream = outputSourceStream(activeStream);
+    const requestId = selected, requestStream = activeStream, requestCursor = rawCursor, stream = outputSourceStream(activeStream);
+    const sourceId = selectedRecord && selectedRecord.output_source_id || requestId;
     try {
-      const sourceId = selectedRecord && selectedRecord.output_source_id || requestId;
       const value = await get('/api/output?id='+encodeURIComponent(sourceId)+'&stream='+encodeURIComponent(stream)+'&cursor='+requestCursor);
-      if (selected !== requestId || rawCursor !== requestCursor) return;
+      if (selected !== requestId || activeStream !== requestStream || rawCursor !== requestCursor || (selectedRecord && selectedRecord.output_source_id || selected) !== sourceId) return;
+      if (!requestCursor) el('raw-output').textContent = '';
       el('raw-output').append(document.createTextNode(value.content)); rawCursor = value.next_cursor;
       el('raw-next').disabled = !value.truncated;
       el('raw-meta').textContent = value.total_bytes.toLocaleString() + ' 字节' + (value.truncated ? ' · 尚有后续内容' : ' · 已读完');
@@ -345,8 +358,35 @@ main{display:grid;grid-template-columns:minmax(250px,310px) minmax(0,1fr);height
       el('target-path').textContent = path;
     }
   }
+  function renderRecordDetails(record) {
+    el('heading').textContent = operationTitle(record);
+    setStatePill(record); setContext(record); renderSummaryFromRecord(record); renderAction(record);
+    el('arguments-item').hidden = !record.arguments;
+    el('arguments').textContent = record.arguments ? JSON.stringify(record.arguments,null,2) : '';
+    const commandDetail = (record.view && record.view.command) || record.command || (record.arguments && record.arguments.command) || '';
+    el('command-detail-item').hidden = !commandDetail;
+    el('command-detail').textContent = commandDetail;
+    const fullPath = (record.view && record.view.workspace_path) || record.actual_cwd || record.cwd || '';
+    el('path-detail-item').hidden = !fullPath;
+    el('path-detail').textContent = fullPath;
+    el('host-detail-item').hidden = !(record.view && record.view.host || record.host);
+    el('host-detail').textContent = (record.view && record.view.host) || record.host || '';
+    el('wrapper').textContent = record.wrapped_command || '（无包装命令记录）';
+    el('wrapped-item').hidden = !record.wrapped_command;
+    const childIds = record.child_commands || [];
+    el('children').replaceChildren();
+    el('child-section').hidden = !record.parent_id && !childIds.length;
+    if (record.parent_id) {
+      const parent = make('button','child','查看上层操作'); parent.type='button'; parent.addEventListener('click',()=>selectManualRecord(record.parent_id)); el('children').append(parent);
+    }
+    childIds.forEach((child,index)=>{const button=make('button','child','内部步骤 '+(index+1));button.type='button';button.addEventListener('click',()=>selectManualRecord(child));el('children').append(button);});
+  }
+  function selectManualRecord(id) {
+    el('follow-latest').checked = id === latestRecordId;
+    return selectRecord(id);
+  }
   async function selectRecord(id, options={}) {
-    selected = id; cursor = 0; rawCursor = 0; selectedRecord = null;
+    selected = id; cursor = 0; rawCursor = 0; selectedRecord = null; streamPinned = false; outputPlaceholder = false;
     if (!options.fromHistory) setUrl(id, Boolean(options.replace));
     updateSelectionStyle(); el('message').textContent = ''; el('output').replaceChildren(); el('raw-output').replaceChildren();
     el('empty').hidden = true; el('operation').hidden = false;
@@ -360,75 +400,79 @@ main{display:grid;grid-template-columns:minmax(250px,310px) minmax(0,1fr);height
     el('raw-next').disabled = true;
     try {
       const record = await get('/api/record?id='+encodeURIComponent(id));
-      if (selected !== id) return;
+      if (selected !== id) return true;
       selectedRecord = record;
-      el('heading').textContent = operationTitle(record);
-      setStatePill(record); setContext(record); renderSummaryFromRecord(record); renderAction(record);
-      el('arguments-item').hidden = !record.arguments;
-      el('arguments').textContent = record.arguments ? JSON.stringify(record.arguments,null,2) : '';
-      const commandDetail = (record.view && record.view.command) || record.command || (record.arguments && record.arguments.command) || '';
-      el('command-detail-item').hidden = !commandDetail;
-      el('command-detail').textContent = commandDetail;
-      const fullPath = (record.view && record.view.workspace_path) || record.actual_cwd || record.cwd || '';
-      el('path-detail-item').hidden = !fullPath;
-      el('path-detail').textContent = fullPath;
-      el('host-detail-item').hidden = !(record.view && record.view.host || record.host);
-      el('host-detail').textContent = (record.view && record.view.host) || record.host || '';
-      el('wrapper').textContent = record.wrapped_command || '（无包装命令记录）';
-      el('wrapped-item').hidden = !record.wrapped_command;
-      const childIds = record.child_commands || [];
-      if (record.parent_id || childIds.length) {
-        el('child-section').hidden = false;
-        if (record.parent_id) {
-          const parent = make('button','child','查看上层操作'); parent.type='button'; parent.addEventListener('click',()=>selectRecord(record.parent_id)); el('children').append(parent);
-        }
-        childIds.forEach((child,index)=>{const button=make('button','child','内部步骤 '+(index+1));button.type='button';button.addEventListener('click',()=>selectRecord(child));el('children').append(button);});
-      }
-      const sizes = record.stream_bytes || record.output_bytes || {};
-      if (Number(sizes.diff || 0) > 0 || record.arguments && record.arguments.mode === 'patch') activeStream = 'diff';
-      else if (Number(sizes.stdout || 0) > 0) activeStream = 'stdout';
-      else if (Number(sizes.stderr || 0) > 0) activeStream = 'stderr';
-      else activeStream = 'stdout';
-      renderStreams(record); await loadOutput(true);
+      renderRecordDetails(record);
+      activeStream = preferredStream(record);
+      renderStreams(record); const ok = await loadOutput(true);
       if (el('raw-details').open) await loadRaw(true);
+      return ok;
     } catch (error) {
-      if (selected !== id) return;
+      if (selected !== id) return true;
       el('heading').textContent = '无法读取操作记录'; el('message').textContent = error.message;
       el('operation').hidden = false;
+      return false;
     }
+  }
+  async function refreshSelectedRecord() {
+    const requestId = selected;
+    const record = await get('/api/record?id='+encodeURIComponent(requestId));
+    if (selected !== requestId) return true;
+    const previousSource = selectedRecord && selectedRecord.output_source_id || requestId, previousStream = activeStream;
+    selectedRecord = record;
+    if (!streamPinned) activeStream = preferredStream(record);
+    const sizes = record.stream_bytes || record.output_bytes || {};
+    const reset = previousSource !== (record.output_source_id || requestId) || previousStream !== activeStream || Number(sizes[outputSourceStream(activeStream)] || 0) < cursor;
+    renderRecordDetails(record); renderStreams(record);
+    const ok = await loadOutput(reset, !reset);
+    if (el('raw-details').open) await loadRaw(reset);
+    return ok;
+  }
+  function refreshStatus(error) {
+    if (error) { el('refresh-status').textContent = '刷新失败：' + error.message; return; }
+    const time = new Intl.DateTimeFormat('zh-CN',{timeZone:'Asia/Shanghai',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false}).format(new Date());
+    const mode = el('live').checked ? (el('follow-latest').checked ? '跟随最新' : '更新当前记录') : '已刷新';
+    el('refresh-status').textContent = mode + ' · 最近更新 ' + time;
   }
   async function poll() {
     if (polling) return; polling = true;
     try {
-      await refreshRecords();
-      if (selected && selectedRecord && ['starting','running'].includes(selectedRecord.status)) {
-        await loadOutput(false, true);
-        const record = await get('/api/record?id='+encodeURIComponent(selected));
-        if (record.id === selected) {
-          selectedRecord = record; setStatePill(record); renderSummaryFromRecord(record);
-        }
-      }
-    } catch (error) { el('message').textContent = error.message; }
+      const rows = await refreshRecords();
+      if (el('live').checked && el('follow-latest').checked && rows.length && selected !== rows[0].id) {
+        if (!await selectRecord(rows[0].id, {replace:true})) throw Error(el('message').textContent || '无法读取操作记录');
+        el('records').scrollTop = 0;
+      } else if (selected && !await refreshSelectedRecord()) throw Error(el('message').textContent || '无法读取操作输出');
+      refreshStatus();
+    } catch (error) { el('message').textContent = error.message; refreshStatus(error); }
     finally { polling = false; }
   }
-  el('refresh').addEventListener('click',()=>refreshRecords().catch(error=>el('message').textContent=error.message));
+  el('refresh').addEventListener('click',poll);
   el('show-technical').addEventListener('change',()=>refreshRecords().catch(error=>el('message').textContent=error.message));
   el('next').addEventListener('click',()=>loadOutput(false,true));
   el('raw-next').addEventListener('click',()=>loadRaw(false));
   el('raw-details').addEventListener('toggle',event=>{if(event.target.open) loadRaw(true);});
-  el('live').addEventListener('change',event=>{
+  function syncPolling() {
     if (timer) clearInterval(timer); timer = null;
-    if (event.target.checked) { poll(); timer=setInterval(poll,2000); }
-  });
+    el('follow-latest').disabled = !el('live').checked;
+    if (!ready) return;
+    if (el('live').checked) { poll(); timer=setInterval(poll,2000); }
+    else el('refresh-status').textContent = '自动刷新已关闭';
+  }
+  el('live').addEventListener('change',syncPolling);
+  el('follow-latest').addEventListener('change',()=>{if(el('follow-latest').checked)el('records').scrollTop=0;if(el('live').checked)poll();});
+  addEventListener('pageshow',syncPolling);
+  addEventListener('pagehide',()=>{if(timer)clearInterval(timer);timer=null;});
+  document.addEventListener('visibilitychange',()=>{if(!document.hidden && el('live').checked)poll();});
   addEventListener('popstate',()=>{
     const id = new URL(location.href).searchParams.get('id');
+    el('follow-latest').checked = false;
     if (id) selectRecord(id,{fromHistory:true});
     else { selected=''; selectedRecord=null; setUrl('',true); el('operation').hidden=true; el('empty').hidden=false; updateSelectionStyle(); }
   });
-  refreshRecords().then(()=>{
+  refreshRecords().then(async()=>{
     const id = new URL(location.href).searchParams.get('id');
-    if (id) selectRecord(id,{fromHistory:true});
-  }).catch(error=>el('message').textContent=error.message);
+    if (id) await selectRecord(id,{fromHistory:true});
+  }).catch(error=>{el('message').textContent=error.message;refreshStatus(error);}).finally(()=>{ready=true;syncPolling();});
 })();
 </script></body></html>'''
 

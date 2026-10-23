@@ -42,6 +42,9 @@ jobs:
         with:
           enable-cache: true
 
+      - name: Check browser-script test runtime
+        run: node --version
+
       - name: Run tests
         run: uv run --frozen --python "${{ matrix.python-version }}" --extra dev pytest -q
 
