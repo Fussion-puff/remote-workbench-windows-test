@@ -39,13 +39,15 @@ from remote_workbench.tools import files, git, commands, patch, search
 async def local(tmp_path, monkeypatch):
     monkeypatch.setenv('REMOTE_WORKBENCH_AUDIT_DIR', str(tmp_path / 'audit'))
     shell = tmp_path / 'native-shell'
-    shell.write_text('#!/bin/sh\n[ "$1" = "-lic" ] || exit 99\nshift\nexec /bin/bash --noprofile --norc -c "$1"\n')
+    shell.write_text('#!/bin/sh\n[ "$1" = "-i" ] && [ "$2" = "-c" ] || exit 99\nshift 2\nexec /bin/bash --noprofile --norc -c "$1"\n')
     shell.chmod(0o700)
     real_create = asyncio.create_subprocess_exec
     async def transport(*args, **kwargs):
         assert args[0] == 'ssh'
         script = args[-1]
-        env = dict(os.environ, HOME=str(tmp_path), SHELL=str(shell), PATH=str(Path(sys.executable).parent)+os.pathsep+os.environ['PATH'])
+        env = dict(os.environ, HOME=str(tmp_path), SHELL=str(shell),
+                   REMOTE_WORKBENCH_LOGIN_SHELL=str(shell),
+                   PATH=str(Path(sys.executable).parent)+os.pathsep+os.environ['PATH'])
         return await real_create('/bin/bash', '--noprofile', '--norc', '-c', script, env=env, **kwargs)
     monkeypatch.setattr('remote_workbench.ssh.asyncio.create_subprocess_exec', transport)
     executor = SSHExecutor(HostConfig(ssh_host='local-simulated', default_cwd=str(tmp_path)))

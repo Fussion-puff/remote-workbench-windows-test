@@ -312,7 +312,7 @@ async def test_native_zsh_startup_aliases_stdin_background_and_fresh_env(local,m
     zsh=shutil.which('zsh')
     if not zsh:pytest.skip('zsh is not installed')
     executor,path=local
-    (path/'native-shell').write_text('#!/bin/sh\nexec '+shlex.quote(zsh)+' "$@"\n')
+    (path/'native-shell').write_text('#!/bin/sh\nexec '+shlex.quote(zsh)+' -l "$@"\n')
     monkeypatch.setenv('ZDOTDIR',str(path))
     (path/'.zprofile').write_text('export REMOTE_WORKBENCH_TEST_PROFILE=profile\n')
     (path/'.zshrc').write_text('export REMOTE_WORKBENCH_TEST_RC=rc\nalias remote-workbench_native_alias="printf alias-loaded"\nfunction remote-workbench_native_function() { printf function-loaded; }\n')

@@ -4,17 +4,21 @@ Remote Workbench keeps the agent and MCP control process on your local machine w
 
 This is an independently maintained derivative of [Onirika](https://github.com/xinyue-uoft/Onirika), released under GNU AGPL version 3. See [UPSTREAM.md](UPSTREAM.md) for provenance and [LICENSE](LICENSE) for the full license text.
 
+中文使用步骤见 [快速上手](docs/quickstart.zh-CN.md)。
+
 ## Use a remote project as the default environment
 
 The recommended entry point, `remote-workbench-workspace`, binds one local MCP process to a host and an absolute remote project directory. Its tools omit the host parameter and resolve relative paths from that project root. Copy [workspace.example.json](workspace.example.json), then set `host` to an alias from your local SSH configuration and `cwd` to the remote project directory.
 
-The workspace starts a fresh remote login shell for each call. It uses the account's default `$SHELL` with login and interactive startup files, so a zsh account loads its normal zsh configuration. A `cd`, `export`, or activated Conda/venv environment does not persist into the next call; activate the environment in each command that needs it. This keeps separate projects and environments independent.
+The workspace starts the remote account's configured login shell for each call, using that shell's own login and interactive startup files. No particular shell, including zsh, is required. Foreground commands and detached jobs use the same selection. Write commands and any preamble in the remote shell's syntax. A directory change, environment variable, or activated Conda/venv environment does not persist into the next call; activate the environment in each command that needs it.
+
+The tool uses a byte-preserving SSH command channel without a PTY. Startup configuration is loaded, but terminal-dependent startup branches and job-control behavior can differ from a manual SSH terminal session. `workspace_info` reports the selected shell and project directory so the agent can verify the connection before editing.
 
 The workspace is a convenient default directory, not a filesystem sandbox: arbitrary shell commands can access anything the remote account can access.
 
 ## Install and configure
 
-Requirements are Python 3.10+ and [uv](https://docs.astral.sh/uv/). The remote account needs a Unix-like system with Python 3.9+ and `fcntl`; Git is needed for Git status, diffs, and patch tools. SSH authentication remains with your local SSH setup and an existing ControlMaster connection.
+Requirements are Python 3.10+ and [uv](https://docs.astral.sh/uv/). The remote account needs a Unix-like system with Python 3.9+ and `fcntl`; `python3` must be available to SSH command sessions. Git is needed for Git status, diffs, and patch tools. SSH authentication remains with your local SSH setup and an existing ControlMaster connection.
 
 ```sh
 git clone https://github.com/chanfeee/remote-workbench.git

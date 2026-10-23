@@ -9,6 +9,7 @@ import os
 import re
 import hashlib
 import shutil
+from pathlib import Path
 from remote_workbench import audit
 from dataclasses import dataclass
 
@@ -39,8 +40,9 @@ class SSHExecutor:
     authentication — it piggybacks on the existing session.
     """
 
-    def __init__(self, host_config: HostConfig):
+    def __init__(self, host_config: HostConfig, remote_state_dir: str | None = None):
         self.config = host_config
+        self.remote_state_dir = remote_state_dir
         self._control_path = host_config.resolved_control_path
         self._last_check: float = 0.0
         self._last_check_ok: bool = False
@@ -98,6 +100,7 @@ class SSHExecutor:
         input_data: bytes | None = None,
         output_budget: int | None = None,
         trace: bool = False,
+        display_command: str | None = None,
     ) -> SSHResult:
         """Run a command on the remote host.
 
@@ -118,11 +121,13 @@ class SSHExecutor:
         if not 256 <= budget <= 1048576:
             raise ValueError("output_budget must be between 256 and 1048576 bytes")
         record_id = audit.create(kind="command", parent_id=audit.operation_id.get(),
-            host=self.config.ssh_target, cwd=cwd, command=command, status="starting",
+            host=self.config.ssh_target, cwd=cwd, command=display_command or command, status="starting",
             stdin_bytes=len(input_data or b""), stdin_sha256=hashlib.sha256(input_data or b"").hexdigest())
         audit.add_child(audit.operation_id.get(), record_id)
         wrapped = self._wrap_command(command, cwd, record_id, trace)
         audit.update(record_id, wrapped_command=wrapped, shell_trace=trace)
+        if display_command is not None:
+            audit.update(record_id, executed_command=command)
         if input_data is not None:
             with audit.open_stream(record_id, "stdin") as output:
                 output.write(input_data)
@@ -265,11 +270,19 @@ class SSHExecutor:
         return SSHResult(contents["stdout"], contents["stderr"], exit_code, timed_out,
                          record_id, truncated, state)
 
+    async def run_program(self, argv: list[str], cwd: str | None = None,
+                          timeout: int | None = None, output_budget: int | None = None,
+                          max_lines: int | None = None, path_indices=()) -> SSHResult:
+        """Execute generated tool arguments without parsing them as shell syntax."""
+        from remote_workbench.remote_program import program_command
+        return await self.run(program_command(argv, max_lines=max_lines, path_indices=path_indices),
+                              cwd=cwd, timeout=timeout, output_budget=output_budget,
+                              display_command=shlex.join(argv))
+
     async def read_file_raw(self, path: str, timeout: int | None = None) -> SSHResult:
         """Read a remote file via cat. Uses file_timeout from config."""
         timeout = timeout or self.config.file_timeout
-        safe_path = shlex.quote(path)
-        result = await self.run(f"cat -- {safe_path}", timeout=timeout)
+        result = await self.run_program(["cat", "--", path], path_indices=[2], timeout=timeout)
         if result.exit_code == 0:
             source = audit.directory(result.output_id) / "stdout"
             if source.stat().st_size > self.config.max_file_size:
@@ -300,30 +313,20 @@ class SSHExecutor:
         self._last_check_ok = False
 
     def _wrap_command(self, command: str, cwd: str, record_id: str = "", trace: bool = False) -> str:
-        """Use the remote account's shell and its normal interactive login config.
-
-        -i is intentional: zsh reads .zshrc only for interactive shells. No PTY
-        is allocated, so machine-readable stdin remains byte-transparent.
-        """
-        parts = []
-        if self.config.preamble:
-            parts.append(self.config.preamble.strip())
-        if cwd == "~":
-            target = '"$HOME"'
-        elif cwd.startswith("~/"):
-            target = '"$HOME"/' + shlex.quote(cwd[2:])
-        else:
-            target = shlex.quote(cwd)
-        parts.append(f"cd -- {target} || exit 125")
+        """Start the configured account shell, without assuming its syntax."""
+        from remote_workbench.remote_shell import python_command
+        markers = None
         if record_id:
-            parts.append(f"printf '\\036REMOTE_WORKBENCH_CWD_{record_id}:%s\\037\\n' \"$PWD\" >&2")
-            parts.append(f"printf '\\036REMOTE_WORKBENCH_STDOUT_{record_id}\\037\\n'")
-        if trace:
-            parts.append("if [ -n \"${ZSH_VERSION:-}\" ]; then PS4='+ %N:%i: '; "
-                         "else PS4='+ ${BASH_SOURCE}:${LINENO}: '; BASH_XTRACEFD=2; fi\nset -x")
-        parts.append(command)
-        script = "\n".join(parts)
-        return f'export TERM="${{TERM:-dumb}}"\nexec "${{SHELL:-/bin/zsh}}" -lic {shlex.quote(script)}'
+            markers = {"stdout": f"\x1eREMOTE_WORKBENCH_STDOUT_{record_id}\x1f\n",
+                       "stderr": f"\x1eREMOTE_WORKBENCH_CWD_{record_id}:%s\x1f\n"}
+        environment = {"REMOTE_WORKBENCH_REMOTE_STATE_DIR": self.remote_state_dir} if self.remote_state_dir else {}
+        arguments = dict(command=command, cwd=cwd, preamble=self.config.preamble,
+                         markers=markers, trace=trace, environment=environment)
+        bootstrap = Path(__file__).with_name("remote_shell.py").read_text()
+        bootstrap += "\n_spec = login_spec(**" + repr(arguments) + ")\n"
+        bootstrap += "_env = dict(os.environ, **_spec['env_updates'])\n"
+        bootstrap += "os.execvpe(_spec['shell'], _spec['argv'], _env)\n"
+        return "exec " + python_command(bootstrap)
 
 
 def _is_ssh_error(stderr: str) -> bool:

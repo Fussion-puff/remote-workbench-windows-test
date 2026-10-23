@@ -1,44 +1,49 @@
 """Tests for SSHExecutor command wrapping and result handling."""
 
 import pytest
+import os
+import subprocess
+import sys
+from pathlib import Path
 
 from remote_workbench.config import HostConfig
 from remote_workbench.ssh import SSHExecutor, SSHResult, _is_ssh_error
 
 
 class TestCommandWrapping:
-    def setup_method(self):
-        self.config = HostConfig(
-            ssh_host="server.example.com",
-            user="alice",
-            preamble="source /opt/env.sh",
-            default_cwd="~/project",
-        )
-        self.executor = SSHExecutor(self.config)
+    def run_wrapped(self, command, cwd, home, preamble=""):
+        executor = SSHExecutor(HostConfig(ssh_host="test", preamble=preamble))
+        env = dict(os.environ, HOME=str(home), ZDOTDIR=str(home),
+                   REMOTE_WORKBENCH_LOGIN_SHELL="/bin/sh",
+                   PATH=str(Path(sys.executable).parent) + os.pathsep + os.environ["PATH"])
+        return subprocess.run(["/bin/sh", "-c", executor._wrap_command(command, str(cwd))],
+                              env=env, capture_output=True, text=True, timeout=10)
 
-    def test_wrap_includes_preamble(self):
-        wrapped = self.executor._wrap_command("make test", "~/project")
-        assert "source /opt/env.sh" in wrapped
-        assert "make test" in wrapped
+    def test_wrap_applies_preamble(self, tmp_path):
+        value = self.run_wrapped('printf "%s" "$REMOTE_WORKBENCH_TEST_VALUE"', tmp_path, tmp_path,
+                                 preamble="export REMOTE_WORKBENCH_TEST_VALUE=loaded")
+        assert value.returncode == 0 and value.stdout == "loaded", value
 
-    def test_wrap_includes_cd(self):
-        wrapped = self.executor._wrap_command("ls", "/some/dir")
-        assert "cd -- /some/dir" in wrapped
+    def test_wrap_enters_requested_directory(self, tmp_path):
+        target = tmp_path / "project"
+        target.mkdir()
+        value = self.run_wrapped("pwd", target, tmp_path)
+        assert value.returncode == 0 and value.stdout.strip() == str(target), value
 
-    def test_wrap_uses_native_interactive_login_shell(self):
-        wrapped = self.executor._wrap_command("echo hi", "~")
-        assert '\nexec "${SHELL:-/bin/zsh}" -lic ' in wrapped
+    def test_wrap_uses_interactive_login_account_shell(self, tmp_path):
+        value = self.run_wrapped('printf "%s:%s" "$0" "$-"', tmp_path, tmp_path)
+        name, options = value.stdout.strip().split(":", 1)
+        assert value.returncode == 0 and name.startswith("-") and "i" in options, value
 
-    def test_wrap_no_preamble(self):
-        config = HostConfig(ssh_host="x", preamble="")
-        executor = SSHExecutor(config)
-        wrapped = executor._wrap_command("echo hi", "~")
-        assert "source" not in wrapped
-        assert "echo hi" in wrapped
+    def test_wrap_cd_failure_stops_user_command(self, tmp_path):
+        value = self.run_wrapped("printf must-not-run", tmp_path / "absent", tmp_path)
+        assert value.returncode == 125 and "must-not-run" not in value.stdout, value
 
-    def test_wrap_quotes_cwd_with_spaces(self):
-        wrapped = self.executor._wrap_command("ls", "/path with spaces")
-        assert "'/path with spaces'" in wrapped
+    def test_wrap_quotes_directory_name(self, tmp_path):
+        target = tmp_path / "space and 'quotes' ; $literal"
+        target.mkdir()
+        value = self.run_wrapped("pwd", target, tmp_path)
+        assert value.returncode == 0 and value.stdout.strip() == str(target), value
 
 
 class TestSSHResult:

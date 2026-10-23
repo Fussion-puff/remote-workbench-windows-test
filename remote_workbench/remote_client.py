@@ -1,17 +1,18 @@
 """Transport JSON requests over stdin; source and content never use shell interpolation."""
 import json
-import shlex
 import uuid
 from pathlib import Path
 from remote_workbench import audit
+from remote_workbench.remote_shell import python_command
 
-SOURCE = Path(__file__).with_name("remote_worker.py").read_text()
+SOURCE = (Path(__file__).with_name("remote_shell.py").read_text() + "\n" +
+          Path(__file__).with_name("remote_worker.py").read_text())
 
 
 async def request(executor, payload, cwd=None, timeout=None):
     payload.setdefault("max_file_size", executor.config.max_file_size)
     payload["_response_id"] = uuid.uuid4().hex
-    return await executor.run("python3 -c " + shlex.quote(SOURCE), cwd=cwd,
+    return await executor.run(python_command(SOURCE), cwd=cwd,
         timeout=timeout or executor.config.file_timeout,
         input_data=json.dumps(payload, ensure_ascii=False).encode())
 

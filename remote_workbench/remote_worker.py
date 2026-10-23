@@ -15,6 +15,9 @@ import sys
 import tempfile
 from contextlib import contextmanager
 
+if "login_spec" not in globals():
+    from remote_workbench.remote_shell import login_spec
+
 
 def state_root():
     default = Path.home() / ".cache" / "remote-workbench-ssh"
@@ -208,7 +211,9 @@ def forward(reader, name):
             output.write(pending)
             output.flush()
 try:
-    process = subprocess.Popen(settings['argv'], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    process = subprocess.Popen(settings['argv'], executable=settings['shell'],
+        env=dict(os.environ, **settings['env_updates']),
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     threads = [threading.Thread(target=forward, args=(getattr(process, name), name)) for name in ('stdout','stderr')]
     for thread in threads: thread.start()
     code = process.wait()
@@ -233,16 +238,14 @@ def job(request):
     if request["op"] == "job_start":
         base.mkdir(parents=True, exist_ok=True, mode=0o700)
         path.mkdir(mode=0o700)  # Exclusive: never overwrite another job.
-        import shlex
         runner = path / "runner.py"
-        shell = os.environ.get("SHELL") or "/bin/zsh"
         # A separate supervisor captures even an explicit `exit` in the user
         # command, while the command itself uses the same native shell as exec.
         prefix = "\x1eREMOTE_WORKBENCH_JOB_" + request["job_id"]
         markers = {name: (prefix + "_" + name + "\x1f\n").encode() for name in ("stdout", "stderr")}
-        prologue = "printf " + shlex.quote(markers["stdout"].decode()) + "\nprintf " + shlex.quote(markers["stderr"].decode()) + " >&2\n"
-        command = prologue + "cd -- " + shlex.quote(os.getcwd()) + " || exit 125\n" + request["command"]
-        settings = {"argv": [shell, "-lic", command], "job_dir": str(path), "markers": markers}
+        spec = login_spec(request["command"], os.getcwd(),
+                          markers={key: value.decode() for key, value in markers.items()})
+        settings = dict(spec, job_dir=str(path), markers=markers)
         script = "settings = " + repr(settings) + "\n" + JOB_SUPERVISOR
         with open(runner, "w", opener=lambda p, f: os.open(p, f, 0o600)) as output:
             output.write(script)

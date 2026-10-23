@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.1 — 2026-10-23
+
+- Use the remote account's configured login shell for commands and detached jobs, with no zsh fallback or fixed-zsh live-test requirement.
+- Launch login shells using the SSH-style login name and preserve native startup files, byte-safe stdin, output framing, project directory binding, and shell-specific tracing.
+- Report the selected shell in `workspace_info` and document the difference between a tool command channel and a manual SSH terminal.
+- Run generated file/search/Git operations with argument arrays, independently of the login shell's quoting and pipeline syntax; preserve real search exit codes while limiting returned lines.
+
 ## 0.2.0 — 2026-10-23
 
 This version prepares an independent Remote Workbench distribution from the Onirika 0.1.0 source baseline. See [UPSTREAM.md](UPSTREAM.md) for the exact upstream commit.

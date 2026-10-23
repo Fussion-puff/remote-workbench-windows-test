@@ -89,8 +89,9 @@ async def run(args):
             wire["tool_schemas"] = {"legacy": oldtools.model_dump(mode="json", exclude_none=True),
                                     "workspace": tools.model_dump(mode="json", exclude_none=True)}
             info = await call("workspace_info")
-            assert info["ready"] and info["probe"].splitlines() == [root, "/bin/zsh"], info
-            passed("bound_remote_zsh_without_remote_codex", {"root": root})
+            assert info["ready"] and info["probe"].splitlines() == [root, info["shell"]], info
+            assert info["shell"].startswith("/"), info
+            passed("bound_remote_account_shell_without_remote_codex", {"root": root, "shell": info["shell"]})
             large = py("import sys; [print('OUTPUT-%05d: '%i+'远端测试-'*8) for i in range(3000)]; print('stderr-visible-marker',file=sys.stderr)")
             failed = "printf '%s\\n' 'EXPECTED_FAILURE_VISIBLE' >&2; exit 7"
             for label, text in [("large_output", large), ("failure", failed)]:

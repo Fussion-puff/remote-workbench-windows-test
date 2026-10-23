@@ -3,10 +3,8 @@
 from __future__ import annotations
 
 import os
-import shlex
 import shutil
 import tempfile
-from remote_workbench.shell_paths import shell_path
 from remote_workbench.remote_client import edit as remote_edit
 
 from remote_workbench.server import mcp, require_connection
@@ -46,29 +44,25 @@ async def ssh_list_dir(
         host: SSH host alias from config. Uses default if omitted.
     """
     executor = await require_connection(host)
-    safe_path = shell_path(path)
-    safe_pattern = shlex.quote(pattern)
     max_entries = int(max_entries)
     if not 1 <= max_entries <= 2000:
         raise ValueError("max_entries must be between 1 and 2000")
 
     if recursive:
-        # Use -exec ls instead of -printf for BSD/macOS compatibility
-        cmd = (
-            f"find {safe_path} -name {safe_pattern} "
-            f"-maxdepth 10 -exec ls -ld {{}} + 2>/dev/null | "
-            f"head -n {max_entries + 1}"
-        )
+        args = ["find", path, "-name", pattern, "-maxdepth", "10", "-exec", "ls", "-ld", "{}", "+"]
+        limit = max_entries + 1
     else:
         # Use find instead of ls glob to avoid shell expansion of pattern
         if pattern == "*":
-            cmd = f"ls -la {safe_path} 2>/dev/null | head -n {max_entries + 2}"
+            args = ["ls", "-la", path]
+            limit = max_entries + 2
         else:
-            cmd = f"find {safe_path} -maxdepth 1 -name {safe_pattern} -exec ls -ld {{}} + 2>/dev/null | head -n {max_entries + 1}"
+            args = ["find", path, "-maxdepth", "1", "-name", pattern, "-exec", "ls", "-ld", "{}", "+"]
+            limit = max_entries + 1
 
-    result = await executor.run("set -o pipefail\n" + cmd, cwd=None)
+    result = await executor.run_program(args, path_indices=[2 if args[0] == "ls" else 1], max_lines=limit)
 
-    if result.exit_code not in (0, 141):
+    if result.exit_code != 0:
         return {"error": "list_failed", "message": result.stderr.strip() or "Directory not found or empty"}
 
     lines = result.stdout.strip().split("\n") if result.stdout.strip() else []
@@ -112,14 +106,11 @@ async def ssh_file_info(
         host: SSH host alias from config. Uses default if omitted.
     """
     executor = await require_connection(host)
-    safe_path = shell_path(path)
 
     # Try GNU stat first, fall back to BSD stat
-    result = await executor.run(
-        f"stat --format='%F|%s|%U|%G|%A|%y' {safe_path} 2>/dev/null || "
-        f"stat -f '%HT|%z|%Su|%Sg|%Sp|%Sm' {safe_path}",
-        cwd=None,
-    )
+    result = await executor.run_program(["stat", "--format=%F|%s|%U|%G|%A|%y", path], path_indices=[2])
+    if result.exit_code != 0:
+        result = await executor.run_program(["stat", "-f", "%HT|%z|%Su|%Sg|%Sp|%Sm", path], path_indices=[3])
 
     if result.exit_code != 0:
         return {"error": "not_found", "message": result.stderr.strip()}
@@ -180,9 +171,8 @@ async def ssh_mkdir(
         host: SSH host alias from config. Uses default if omitted.
     """
     executor = await require_connection(host)
-    safe_path = shell_path(path)
-    flag = "-p " if parents else ""
-    result = await executor.run(f"mkdir {flag}{safe_path}", cwd=None)
+    args = ["mkdir", *(["-p"] if parents else []), path]
+    result = await executor.run_program(args, path_indices=[len(args) - 1])
 
     if result.exit_code != 0:
         return {"error": "mkdir_failed", "message": result.stderr.strip()}
@@ -203,9 +193,7 @@ async def ssh_move(
         host: SSH host alias from config. Uses default if omitted.
     """
     executor = await require_connection(host)
-    result = await executor.run(
-        f"mv {shell_path(source)} {shell_path(dest)}", cwd=None
-    )
+    result = await executor.run_program(["mv", source, dest], path_indices=[1, 2])
 
     if result.exit_code != 0:
         return {"error": "move_failed", "message": result.stderr.strip()}
@@ -226,8 +214,8 @@ async def ssh_delete(
         host: SSH host alias from config. Uses default if omitted.
     """
     executor = await require_connection(host)
-    flag = "-r " if recursive else ""
-    result = await executor.run(f"rm {flag}{shell_path(path)}", cwd=None)
+    args = ["rm", *(["-r"] if recursive else []), path]
+    result = await executor.run_program(args, path_indices=[len(args) - 1])
 
     if result.exit_code != 0:
         return {"error": "delete_failed", "message": result.stderr.strip()}
@@ -248,7 +236,6 @@ async def ssh_download(
         host: SSH host alias from config. Uses default if omitted.
     """
     executor = await require_connection(host)
-    safe_remote = shell_path(remote_path)
 
     if not local_dir:
         local_dir = os.path.expanduser("~/Downloads")
@@ -266,7 +253,7 @@ async def ssh_download(
     local_path = os.path.join(local_dir, filename)
 
     # Read via SSH and write locally
-    result = await executor.run(f"cat {safe_remote}", cwd=None, timeout=executor.config.file_timeout)
+    result = await executor.run_program(["cat", remote_path], path_indices=[1], timeout=executor.config.file_timeout)
 
     if result.exit_code != 0:
         return {"error": "download_failed", "message": result.stderr.strip()}

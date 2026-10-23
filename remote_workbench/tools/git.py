@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import shlex
 from remote_workbench import audit
 
 from remote_workbench.server import mcp, require_connection
@@ -23,7 +22,7 @@ async def ssh_git_status(
     """
     executor = await require_connection(host)
 
-    result = await executor.run("git status --porcelain=v1 -z -b", cwd=cwd)
+    result = await executor.run_program(["git", "status", "--porcelain=v1", "-z", "-b"], cwd=cwd)
     if result.exit_code != 0:
         return {"error": "git_failed", "message": result.stderr.strip()}
 
@@ -145,7 +144,7 @@ async def ssh_git_diff(cwd: str | None = None, ref: str = "", path: str = "", st
     if ref:
         args.append(ref)
     args += ["--", *(paths or ([path] if path else []))]
-    result = await executor.run(shlex.join(args), cwd=cwd, output_budget=max_bytes)
+    result = await executor.run_program(args, cwd=cwd, output_budget=max_bytes)
     if result.exit_code != 0:
         return {"error": "git_failed", "message": result.stderr, "output_id": result.output_id}
     if mode == "patch":
@@ -181,9 +180,9 @@ async def ssh_git_log(
 
     cmd_parts = ["git", "log", fmt, f"-n{count}"]
     if path:
-        cmd_parts.extend(["--", shlex.quote(path)])
+        cmd_parts.extend(["--", path])
 
-    result = await executor.run(" ".join(cmd_parts), cwd=cwd)
+    result = await executor.run_program(cmd_parts, cwd=cwd)
 
     if result.exit_code != 0:
         return {"error": "git_failed", "message": result.stderr.strip()}

@@ -2,9 +2,6 @@
 
 from __future__ import annotations
 
-import shlex
-from remote_workbench.shell_paths import shell_path
-
 from remote_workbench.server import mcp, require_connection
 
 
@@ -32,33 +29,35 @@ async def ssh_grep(
         host: SSH host alias from config. Uses default if omitted.
     """
     executor = await require_connection(host)
-    safe_path = shell_path(path)
-    safe_pattern = shlex.quote(pattern)
     context_lines = int(context_lines)
     max_results = int(max_results)
     if not 1 <= max_results <= 2000 or not 0 <= context_lines <= 100:
         raise ValueError("Invalid max_results/context_lines")
+    if not path:
+        raise ValueError("path must not be empty")
 
     args = ["grep", "-rn"]
     if case_insensitive:
         args.append("-i")
     if context_lines > 0:
-        args.append(f"-C{context_lines}")
+        args.extend(["-C", str(context_lines)])
     if glob:
-        args.extend(["--include", shlex.quote(glob)])
-    args.extend(["--", safe_pattern])
-    args.append(safe_path)
+        args.extend(["--include", glob])
+    args.extend(["--", pattern, path])
 
-    cmd = "set -o pipefail\n" + " ".join(args) + f" | head -n {max_results + 1}"
-    result = await executor.run(cmd)
+    result = await executor.run_program(
+        args, max_lines=max_results + 1, path_indices=[len(args) - 1]
+    )
 
-    if result.exit_code == 1 and not result.stdout.strip():
+    if result.exit_code == 1 and not result.stdout:
         return {"matches": [], "count": 0, "truncated": False, "message": "No matches found."}
 
-    if result.exit_code not in (0, 1, 141):
+    if result.exit_code not in (0, 1):
         return {"error": "grep_failed", "message": result.stderr.strip(), "output_id": result.output_id}
 
-    lines = result.stdout.strip().split("\n") if result.stdout.strip() else []
+    lines = result.stdout.split("\n") if result.stdout else []
+    if lines and lines[-1] == "":
+        lines.pop()
     truncated = len(lines) > max_results or result.truncated
     lines = lines[:max_results]
 
@@ -90,28 +89,30 @@ async def ssh_find_files(
         host: SSH host alias from config. Uses default if omitted.
     """
     executor = await require_connection(host)
-    safe_path = shell_path(path)
     max_depth = int(max_depth)
     max_results = int(max_results)
     if not 1 <= max_results <= 2000 or not 0 <= max_depth <= 100:
         raise ValueError("Invalid max_results/max_depth")
+    if not path:
+        raise ValueError("path must not be empty")
 
     # Validate file_type against allowlist to prevent injection
     valid_types = {"f", "d", "l", "b", "c", "p", "s", ""}
     if file_type not in valid_types:
         return {"error": "invalid_type", "message": f"file_type must be one of: {', '.join(sorted(valid_types - {''}))} (or empty)"}
 
-    args = ["find", safe_path, "-maxdepth", str(max_depth)]
+    args = ["find", path, "-maxdepth", str(max_depth)]
     if file_type:
         args.extend(["-type", file_type])
-    args.extend(["-name", shlex.quote(pattern)])
-    cmd = "set -o pipefail\n" + " ".join(args) + f" | head -n {max_results + 1}"
+    args.extend(["-name", pattern])
 
-    result = await executor.run(cmd)
-    if result.exit_code not in (0, 141):
+    result = await executor.run_program(args, max_lines=max_results + 1, path_indices=[1])
+    if result.exit_code != 0:
         return {"error": "find_failed", "message": result.stderr.strip(), "output_id": result.output_id}
 
-    lines = result.stdout.strip().split("\n") if result.stdout.strip() else []
+    lines = result.stdout.split("\n") if result.stdout else []
+    if lines and lines[-1] == "":
+        lines.pop()
     truncated = len(lines) > max_results or result.truncated
     lines = lines[:max_results]
 

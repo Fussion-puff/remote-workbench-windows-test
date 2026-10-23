@@ -70,9 +70,10 @@ async def run(args):
         async def info():
             value = await call("workspace_info")
             assert value["ready"] and value["control"] == "local", value
-            assert value["probe"].splitlines() == [root, "/bin/zsh"], value
+            assert value["probe"].splitlines() == [root, value["shell"]], value
+            assert value["shell"].startswith("/"), value
             return value
-        await check("local_control_remote_directory_and_zsh", info)
+        await check("local_control_remote_directory_and_account_shell", info)
         async def schema():
             tools = await session.list_tools()
             report["bound_schema_bytes"] = len(json.dumps([t.model_dump(exclude_none=True) for t in tools.tools]).encode())

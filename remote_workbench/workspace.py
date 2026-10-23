@@ -11,7 +11,6 @@ import json
 from pathlib import Path
 import posixpath
 import re
-import shlex
 import sys
 from threading import Thread
 from typing import Any
@@ -57,9 +56,8 @@ class Workspace:
         cwd = posixpath.normpath(cwd)
         # Default shells load their own configuration. Do not carry a configured
         # host preamble/activated environment into a workspace automatically.
-        config = replace(base, default_cwd=cwd,
-                         preamble="export REMOTE_WORKBENCH_REMOTE_STATE_DIR=" + shlex.quote(cwd + "/.remote-workbench-state"))
-        return cls(name, host, cwd, SSHExecutor(config))
+        config = replace(base, default_cwd=cwd, preamble="")
+        return cls(name, host, cwd, SSHExecutor(config, remote_state_dir=cwd + "/.remote-workbench-state"))
 
     def resolve_cwd(self, cwd: str | None = None) -> str:
         if cwd is None or cwd == "":
@@ -170,9 +168,17 @@ def create_server(workspace: Workspace) -> FastMCP:
                   "control": "local", "execution": "remote", "connected": connected,
                   "shell_state_reused": False, "connection_message": message}
         if connected:
-            probe = await workspace.executor.run("printf '%s\\n' \"$PWD\" \"$SHELL\"", output_budget=2048)
+            probe_code = ('import json,os; print(json.dumps({"cwd":os.getcwd(), '
+                          '"shell":os.environ.get("REMOTE_WORKBENCH_LOGIN_SHELL", "")}))')
+            probe = await workspace.executor.run_program(["python3", "-c", probe_code], output_budget=2048)
             result.update(ready=probe.exit_code == 0, probe=probe.stdout,
                           stderr=probe.stderr, output_id=probe.output_id)
+            if probe.exit_code == 0:
+                try:
+                    detail = json.loads(probe.stdout)
+                    result.update(shell=detail["shell"], probe=detail["cwd"] + "\n" + detail["shell"] + "\n")
+                except (ValueError, KeyError, TypeError):
+                    result.update(ready=False, stderr="Invalid remote shell probe")
         else:
             result["ready"] = False
         return result
