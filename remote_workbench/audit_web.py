@@ -565,6 +565,16 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 
+def handler_for_directory(path):
+    """Create an HTTP handler permanently scoped to one session's records."""
+    class ScopedHandler(Handler):
+        def do_GET(self):
+            with audit.scoped_root(path):
+                super().do_GET()
+
+    return ScopedHandler
+
+
 def main():
     parser = argparse.ArgumentParser(description="Remote Workbench local audit viewer")
     parser.add_argument("--port", type=int, default=8766)

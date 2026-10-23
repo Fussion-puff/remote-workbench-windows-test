@@ -7,15 +7,42 @@ import os
 import re
 import time
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 
 operation_id = contextvars.ContextVar("operation_id", default=None)
+_scoped_root = contextvars.ContextVar("audit_root", default=None)
 _ID = re.compile(r"^[a-f0-9]{32}$")
 STREAMS = {"stdout", "stderr", "stdin", "diff", "startup_stdout", "startup_stderr"}
 
 
+def base_root() -> Path:
+    """Resolve the configured audit root without creating it or a session."""
+    return Path(os.environ.get(
+        "REMOTE_WORKBENCH_AUDIT_DIR",
+        Path(__file__).resolve().parent.parent / ".remote-workbench-audit",
+    ))
+
+
+@contextmanager
+def scoped_root(path):
+    """Bind audit operations in this context to a session-specific directory.
+
+    Context variables keep concurrent MCP calls isolated without mutating the
+    process-wide environment. Threads that serve the HTTP viewer should bind
+    their own root explicitly with this context manager.
+    """
+    token = _scoped_root.set(Path(path).expanduser())
+    try:
+        yield
+    finally:
+        _scoped_root.reset(token)
+
+
 def root() -> Path:
-    path = Path(os.environ.get("REMOTE_WORKBENCH_AUDIT_DIR", Path(__file__).resolve().parent.parent / ".remote-workbench-audit"))
+    path = _scoped_root.get()
+    if path is None:
+        path = base_root()
     path.mkdir(mode=0o700, parents=True, exist_ok=True)
     return path
 

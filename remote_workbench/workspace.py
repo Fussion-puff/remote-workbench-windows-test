@@ -4,7 +4,7 @@ from __future__ import annotations
 import argparse
 import errno
 from dataclasses import dataclass, replace
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 import functools
 from http.server import ThreadingHTTPServer
 import inspect
@@ -17,9 +17,11 @@ from threading import Thread
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.exceptions import ToolError
 
+from remote_workbench import audit
 from remote_workbench.config import load_config
-from remote_workbench.audit_web import Handler as AuditViewerHandler
+from remote_workbench.audit_web import Handler as AuditViewerHandler, handler_for_directory
 from remote_workbench.server import workspace_executor
 from remote_workbench.ssh import SSHExecutor
 from remote_workbench.tools import commands, files, git, search, patch, audit as audit_tools
@@ -89,7 +91,7 @@ TOOLS = [
 ]
 
 
-def bind_tool(workspace: Workspace, name: str, function, description: str):
+def bind_tool(workspace: Workspace, name: str, function, description: str, *, workspace_provider=None):
     signature = inspect.signature(function, eval_str=True)
     parameters = [p.replace(default=".") if p.name == "cwd" else p
                   for p in signature.parameters.values() if p.name != "host"]
@@ -102,11 +104,12 @@ def bind_tool(workspace: Workspace, name: str, function, description: str):
         # to smuggle a different host past the public schema.
         bound = public_signature.bind(**kwargs)
         arguments = dict(bound.arguments)
+        active_workspace = workspace_provider() if workspace_provider else workspace
         if "host" in signature.parameters:
-            arguments["host"] = workspace.host
+            arguments["host"] = active_workspace.host
         if "cwd" in signature.parameters:
-            arguments["cwd"] = workspace.resolve_cwd(arguments.get("cwd"))
-        token = workspace_executor.set((workspace.host, workspace.executor))
+            arguments["cwd"] = active_workspace.resolve_cwd(arguments.get("cwd"))
+        token = workspace_executor.set((active_workspace.host, active_workspace.executor))
         try:
             return await function(**arguments)
         finally:
@@ -120,7 +123,8 @@ def bind_tool(workspace: Workspace, name: str, function, description: str):
     return invoke
 
 
-def _workspace_response(tool, default_max_bytes: int | None = None):
+def _workspace_response(tool, default_max_bytes: int | None = None, *, viewer_url=None,
+                        session=None, prepare_session=True):
     """Serialize a workspace tool result once, as compact JSON text.
 
     FastMCP's default structured-output mode sends dict results twice: once as
@@ -139,8 +143,27 @@ def _workspace_response(tool, default_max_bytes: int | None = None):
     async def invoke(**kwargs):
         if default_max_bytes is not None:
             kwargs.setdefault("max_bytes", default_max_bytes)
-        result = await tool(**kwargs)
-        return json.dumps(result, ensure_ascii=False, separators=(",", ":"), default=str)
+        with audit.scoped_root(session.audit_dir) if session else nullcontext():
+            try:
+                if session is not None and prepare_session:
+                    await session.ensure_ready()
+                result = await tool(**kwargs)
+            except Exception as exc:
+                if viewer_url is None:
+                    raise
+                # Preserve MCP's error flag while also giving failed calls a
+                # visible session record link. Cancellation still propagates.
+                raise ToolError(f"{exc}\n\n[**Remote Workbench 操作记录**]({viewer_url})") from exc
+            if viewer_url is not None:
+                record_id = result.get("operation_id") or result.get("output_id") or result.get("id")
+                link = viewer_url
+                if (isinstance(record_id, str) and re.fullmatch(r"[a-f0-9]{32}", record_id)
+                        and (audit.directory(record_id) / "record.json").is_file()):
+                    link += "?id=" + record_id
+                result["operation_log"] = f"[**Remote Workbench 操作记录**]({link})"
+            if session is not None:
+                result["session_id"] = session.id
+            return json.dumps(result, ensure_ascii=False, separators=(",", ":"), default=str)
 
     invoke.__name__ = tool.__name__
     invoke.__doc__ = tool.__doc__
@@ -150,7 +173,10 @@ def _workspace_response(tool, default_max_bytes: int | None = None):
     return invoke
 
 
-def create_server(workspace: Workspace, *, viewer_url: str | None = None) -> FastMCP:
+def create_server(workspace: Workspace, *, viewer_url: str | None = None, session=None) -> FastMCP:
+    source_workspace = workspace
+    if session is not None:
+        workspace = session.workspace
     server = FastMCP("remote-workbench-workspace-" + workspace.name, instructions=(
         f"Default project environment: {workspace.host}:{workspace.cwd}. "
         "Use these tools for all project commands, files, search, edits, Git and tests. "
@@ -160,21 +186,33 @@ def create_server(workspace: Workspace, *, viewer_url: str | None = None) -> Fas
         "Control and audit records stay local; only shell/Python workers run remotely. "
         "On SSH failure stop and report; never fall back to local project execution. "
         "This is a default directory, not a filesystem sandbox."
-        + (f" Local audit viewer: {viewer_url}." if viewer_url else "")
+        + (f" Local audit viewer: {viewer_url}. Every tool result supplies operation_log. "
+           "Whenever you use these tools, include its Markdown link with the exact bold title "
+           "'Remote Workbench 操作记录' in your user-facing update and final reply. "
+           "Use the returned link directly; no separate workspace_info call is needed for it."
+           if viewer_url else "")
+        + (" This MCP session has its own project copy, records, outputs and jobs. "
+           f"The original project {source_workspace.cwd} is a template; use the session cwd above. "
+           "Do not reuse IDs or project paths from other sessions."
+           if session is not None else "")
     ))
 
     async def workspace_info() -> dict[str, Any]:
         """Verify the bound remote directory and default shell; report local control placement."""
-        connected, message = await workspace.executor.check_connection(force=True)
-        result = {"name": workspace.name, "host": workspace.host, "cwd": workspace.cwd,
+        active_workspace = session.workspace if session is not None else workspace
+        connected, message = await active_workspace.executor.check_connection(force=True)
+        result = {"name": active_workspace.name, "host": active_workspace.host, "cwd": active_workspace.cwd,
                   "control": "local", "execution": "remote", "connected": connected,
                   "shell_state_reused": False, "connection_message": message}
         if viewer_url is not None:
             result["viewer_url"] = viewer_url
+        if session is not None:
+            result.update(source_cwd=source_workspace.cwd, project_isolated=True,
+                          session_id=session.id)
         if connected:
             probe_code = ('import json,os; print(json.dumps({"cwd":os.getcwd(), '
                           '"shell":os.environ.get("REMOTE_WORKBENCH_LOGIN_SHELL", "")}))')
-            probe = await workspace.executor.run_program(["python3", "-c", probe_code], output_budget=2048)
+            probe = await active_workspace.executor.run_program(["python3", "-c", probe_code], output_budget=2048)
             result.update(ready=probe.exit_code == 0, probe=probe.stdout,
                           stderr=probe.stderr, output_id=probe.output_id)
             if probe.exit_code == 0:
@@ -187,7 +225,8 @@ def create_server(workspace: Workspace, *, viewer_url: str | None = None) -> Fas
             result["ready"] = False
         return result
 
-    server.tool(structured_output=False)(_workspace_response(workspace_info))
+    server.tool(structured_output=False)(_workspace_response(
+        workspace_info, viewer_url=viewer_url, session=session))
 
     for name, function, description in TOOLS:
         default_max_bytes = {
@@ -196,13 +235,16 @@ def create_server(workspace: Workspace, *, viewer_url: str | None = None) -> Fas
             "patch_file": 4096,
             "git_diff": 4096,
         }.get(name)
-        tool = bind_tool(workspace, name, function, description)
-        server.tool(structured_output=False)(_workspace_response(tool, default_max_bytes))
+        tool = bind_tool(workspace, name, function, description,
+                         workspace_provider=(lambda: session.workspace) if session is not None else None)
+        server.tool(structured_output=False)(_workspace_response(
+            tool, default_max_bytes, viewer_url=viewer_url, session=session,
+            prepare_session=name not in {"read_output", "audit_get", "audit_list"}))
     return server
 
 
 @contextmanager
-def _local_audit_viewer(port: int | None):
+def _local_audit_viewer(port: int | None, *, audit_dir=None):
     """Optionally serve the audit viewer on loopback for this MCP lifetime."""
     if port is None:
         yield None
@@ -210,14 +252,15 @@ def _local_audit_viewer(port: int | None):
     if isinstance(port, bool) or not 1 <= port <= 65535:
         raise ValueError("viewer port must be between 1 and 65535")
 
+    handler = handler_for_directory(audit_dir) if audit_dir is not None else AuditViewerHandler
     try:
-        viewer = ThreadingHTTPServer(("127.0.0.1", port), AuditViewerHandler)
+        viewer = ThreadingHTTPServer(("127.0.0.1", port), handler)
     except OSError as exc:
         if exc.errno != errno.EADDRINUSE:
             raise
         # MCP clients can start one process per chat or discovery request.
         # Keep each process's viewer independent of whoever owns this port.
-        viewer = ThreadingHTTPServer(("127.0.0.1", 0), AuditViewerHandler)
+        viewer = ThreadingHTTPServer(("127.0.0.1", 0), handler)
         print(f"Audit viewer port {port} is in use; using {viewer.server_port}.",
               file=sys.stderr, flush=True)
     thread = Thread(
@@ -244,16 +287,18 @@ def _local_audit_viewer(port: int | None):
 def main():
     parser = argparse.ArgumentParser(description="Local Remote Workbench MCP bound to one remote workspace")
     parser.add_argument("--workspace", required=True, help="Local workspace JSON manifest")
-    parser.add_argument("--viewer-port", type=int,
-                        help="Preferred local audit viewer port; if occupied, use an available port")
+    parser.add_argument("--viewer-port", type=int, default=8768,
+                        help="Preferred local audit viewer port (default 8768); if occupied, use an available port")
     args = parser.parse_args()
     workspace = Workspace.load(args.workspace)
-    with _local_audit_viewer(args.viewer_port) as viewer:
+    from remote_workbench.workspace_session import WorkspaceSession
+    session = WorkspaceSession(workspace)
+    with _local_audit_viewer(args.viewer_port, audit_dir=session.audit_dir) as viewer:
         viewer_url = None
         if viewer is not None:
             viewer_url = f"http://127.0.0.1:{viewer.server_port}"
             print(f"Local audit viewer: {viewer_url}", file=sys.stderr, flush=True)
-        create_server(workspace, viewer_url=viewer_url).run()
+        create_server(workspace, viewer_url=viewer_url, session=session).run()
 
 
 if __name__ == "__main__":

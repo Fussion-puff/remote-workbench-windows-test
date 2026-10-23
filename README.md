@@ -10,13 +10,19 @@ This is an independently maintained derivative of [Onirika](https://github.com/x
 
 ## Use a remote project as the default environment
 
-The recommended entry point, `remote-workbench-workspace`, binds one local MCP process to a host and an absolute remote project directory. Its tools omit the host parameter and resolve relative paths from that project root. Copy [workspace.example.json](workspace.example.json), then set `host` to an alias from your local SSH configuration and `cwd` to the remote project directory.
+The recommended entry point, `remote-workbench-workspace`, binds one local MCP process to a host and an absolute remote template directory. Its tools omit the host parameter and resolve relative paths from that process's private project copy. Copy [workspace.example.json](workspace.example.json), then set `host` to an alias from your local SSH configuration and `cwd` to the remote project template.
 
 The workspace starts the remote account's configured login shell for each call, using that shell's own login and interactive startup files. No particular shell, including zsh, is required. Foreground commands and detached jobs use the same selection. Write commands and any preamble in the remote shell's syntax. A directory change, environment variable, or activated Conda/venv environment does not persist into the next call; activate the environment in each command that needs it.
 
 The tool uses a byte-preserving SSH command channel without a PTY. Startup configuration is loaded, but terminal-dependent startup branches and job-control behavior can differ from a manual SSH terminal session. `workspace_info` reports the selected shell and project directory so the agent can verify the connection before editing.
 
 The workspace is a convenient default directory, not a filesystem sandbox: arbitrary shell commands can access anything the remote account can access.
+
+## Sessions and operation records
+
+From version 0.2.3, each workspace MCP stdio process creates a fresh UUID session at startup. Its local audit records, saved outputs, and viewer are isolated from other process sessions. The first remote tool call creates a separate project copy alongside the configured source directory; the configured project remains a template and is not edited by workspace tools. Restarting the MCP creates a new session and project copy while retaining earlier copies and records. Git copies include the current working tree, including uncommitted changes and non-ignored untracked files; ignored dependencies, environment directories, and caches are left out. See [Session isolation and operation records](docs/sessions.zh-CN.md) for the path layout and client boundary.
+
+Every workspace JSON tool result includes its `session_id` and an `operation_log` Markdown link; MCP tool exceptions retain their error flag and include the link in the error text. MCP instructions ask the agent to include the supplied link, with the exact visible title **Remote Workbench 操作记录**, in its reply after using a tool. The link points to that session's viewer and operation; its local port can vary when the preferred port is busy. This is an agent-facing default implemented through MCP instructions and returned data, not a way for the server to force Codex to render a native terminal or file-change card. No extra `workspace_info` call is needed just to obtain the operation-record link.
 
 ## Install and configure
 
@@ -45,7 +51,7 @@ Edit `workspace.json` with the actual SSH alias and remote project path before u
 
 Update the paths in [codex-mcp.example.toml](codex-mcp.example.toml) for your clone and workspace manifest, then add the MCP entry to your local client's configuration. After `uv sync`, the environment and entry points exist under the checkout. Configure one of these modes for a project:
 
-- `remote-workbench-workspace` — one host and project root, recommended for remote-first coding. Pass `--viewer-port 8768` to serve the local audit viewer while the MCP process runs.
+- `remote-workbench-workspace` — one host and project template, recommended for remote-first coding. It serves the session's local audit viewer on loopback by default while the MCP process runs; `--viewer-port` sets its preferred port.
 - `remote-workbench-ssh` — the multi-host MCP with an explicit `host` argument on its tools.
 - `remote-workbench-audit` — serve the local read-only audit viewer separately.
 
@@ -53,7 +59,7 @@ Update the paths in [codex-mcp.example.toml](codex-mcp.example.toml) for your cl
 
 ## Commands, output, and code changes
 
-The local audit viewer presents the actual remote command, its output, and file diffs in a readable page. With `--viewer-port 8768`, it prefers `http://127.0.0.1:8768`. If another process already uses that port, it selects an available local port so concurrent MCP instances can start. `workspace_info.viewer_url` and startup stderr report the actual URL. Each process serves its own configured audit directory; it does not reuse the service occupying the preferred port. The page reads local audit files directly without sending them back through MCP. The viewer is a separate page: it does not turn ordinary MCP calls into Codex's native terminal or file-change cards. If an agent explicitly reads saved output through MCP, that content still uses model context.
+The local audit viewer presents the actual remote command, its output, and file diffs in a readable page. With `--viewer-port 8768`, it prefers `http://127.0.0.1:8768`. If another process already uses that port, it selects an available local port so concurrent MCP instances can start. The `operation_log` links in tool results point to the actual session viewer and operation; `workspace_info.viewer_url` and startup stderr also report the actual viewer URL. Each process serves its own session audit data and does not reuse the service occupying the preferred port. The page reads local audit files directly without sending them back through MCP. The viewer is a separate page: it does not turn ordinary MCP calls into Codex's native terminal or file-change cards. If an agent explicitly reads saved output through MCP, that content still uses model context.
 
 The bound workspace returns compact previews by default: 2 KiB for command output and 4 KiB for file, patch, and Git diff output. Full output and diffs remain in local audit records and can be read in pages when needed. MCP responses use one compact JSON text result rather than duplicating it in text and structured content.
 
