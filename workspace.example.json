@@ -1,0 +1,6 @@
+{
+  "version": 1,
+  "name": "example-project",
+  "host": "myserver",
+  "cwd": "/absolute/remote/path/to/project"
+}

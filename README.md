@@ -1,0 +1,64 @@
+# Remote Workbench
+
+Remote Workbench keeps the agent and MCP control process on your local machine while using a remote SSH project as its working environment. The remote side runs ordinary shell commands and a small Python worker sent over SSH; it does not need Codex CLI or a separately installed service.
+
+This is an independently maintained derivative of [Onirika](https://github.com/xinyue-uoft/Onirika), released under GNU AGPL version 3. See [UPSTREAM.md](UPSTREAM.md) for provenance and [LICENSE](LICENSE) for the full license text.
+
+## Use a remote project as the default environment
+
+The recommended entry point, `remote-workbench-workspace`, binds one local MCP process to a host and an absolute remote project directory. Its tools omit the host parameter and resolve relative paths from that project root. Copy [workspace.example.json](workspace.example.json), then set `host` to an alias from your local SSH configuration and `cwd` to the remote project directory.
+
+The workspace starts a fresh remote login shell for each call. It uses the account's default `$SHELL` with login and interactive startup files, so a zsh account loads its normal zsh configuration. A `cd`, `export`, or activated Conda/venv environment does not persist into the next call; activate the environment in each command that needs it. This keeps separate projects and environments independent.
+
+The workspace is a convenient default directory, not a filesystem sandbox: arbitrary shell commands can access anything the remote account can access.
+
+## Install and configure
+
+Requirements are Python 3.10+ and [uv](https://docs.astral.sh/uv/). The remote account needs a Unix-like system with Python 3.9+ and `fcntl`; Git is needed for Git status, diffs, and patch tools. SSH authentication remains with your local SSH setup and an existing ControlMaster connection.
+
+```sh
+git clone https://github.com/chanfeee/remote-workbench.git
+cd remote-workbench
+uv sync --locked --extra dev
+```
+
+Copy `config.example.yaml` to `~/.config/remote-workbench/config.yaml` and set your host alias, SSH destination, account, ControlMaster path, and default directory. Its `preamble` is empty by default. Use a preamble only when you intentionally want it run before every command.
+
+```sh
+mkdir -p ~/.config/remote-workbench
+cp config.example.yaml ~/.config/remote-workbench/config.yaml
+cp workspace.example.json workspace.json
+uv run remote-workbench establish myserver
+```
+
+Edit `workspace.json` with the actual SSH alias and remote project path before using the workspace MCP entry.
+
+`REMOTE_WORKBENCH_CONFIG` or the `--config` option on `remote-workbench-ssh` can select another local YAML file. The workspace manifest can also name a config file with its optional `config` field. Existing Onirika settings are not discovered or migrated automatically; review and copy the host settings you want into the new config.
+
+## Connect an MCP client
+
+Update the paths in [codex-mcp.example.toml](codex-mcp.example.toml) for your clone and workspace manifest, then add the MCP entry to your local client's configuration. After `uv sync`, the environment and entry points exist under the checkout. Configure one of these modes for a project:
+
+- `remote-workbench-workspace` — one host and project root, recommended for remote-first coding. Pass `--viewer-port 8768` to serve the local audit viewer while the MCP process runs.
+- `remote-workbench-ssh` — the multi-host MCP with an explicit `host` argument on its tools.
+- `remote-workbench-audit` — serve the local read-only audit viewer separately.
+
+`remote-workbench` is the command dispatcher for setup, SSH connection, gateway, and other bundled commands. The MCP tools do not execute Codex CLI remotely.
+
+## Commands, output, and code changes
+
+The local audit viewer presents the actual remote command, its output, and file diffs in a readable page. With `--viewer-port`, it is available at `http://127.0.0.1:8768`; it reads the local audit files directly and does not send them back through MCP. The viewer is a separate page: it does not turn ordinary MCP calls into Codex's native terminal or file-change cards. If an agent explicitly reads saved output through MCP, that content still uses model context.
+
+The bound workspace returns compact previews by default: 2 KiB for command output and 4 KiB for file, patch, and Git diff output. Full output and diffs remain in local audit records and can be read in pages when needed. MCP responses use one compact JSON text result rather than duplicating it in text and structured content.
+
+File edits can use hash-guarded replacements or unified Git patches. Review the returned change with `git_diff` or `git_status`, then run the relevant checks on the remote host. Remote jobs run only when explicitly started.
+
+Local audit files can contain commands, arguments, file contents, and output. Keep them private. Set `REMOTE_WORKBENCH_AUDIT_DIR` to choose their local directory; the default directory name is `.remote-workbench-audit`. In a bound workspace, remote lock and job state is stored beneath the workspace root in `.remote-workbench-state`; `REMOTE_WORKBENCH_REMOTE_STATE_DIR` controls the remote state directory for other modes.
+
+## Configuration migration
+
+The renamed project uses the `remote_workbench` Python package, `remote-workbench` command names, `REMOTE_WORKBENCH_*` environment variables, and `~/.config/remote-workbench/config.yaml`. It does not load the previous `onirika` configuration path by default. To move from an earlier installation, copy only the host settings you still need, check the ControlMaster socket path, and update your MCP command. Keep the previous installation available until you have verified the new one.
+
+## License and network use
+
+Remote Workbench is distributed under GNU AGPL version 3, as a modified work based on Onirika. If you operate a modified version as a network service, make the corresponding source for the version users interact with available as required by AGPLv3. See [LICENSE](LICENSE).

@@ -1,0 +1,12 @@
+# Example local Codex MCP entry for one remote-first project.
+# Replace both absolute paths after cloning and copying workspace.example.json.
+[mcp_servers.remote-workbench-workspace]
+command = "/absolute/path/to/remote-workbench/.venv/bin/remote-workbench-workspace"
+args = ["--workspace", "/absolute/path/to/workspace.json", "--viewer-port", "8768"]
+env = { REMOTE_WORKBENCH_AUDIT_DIR = "/absolute/path/to/remote-workbench/.remote-workbench-audit" }
+
+# For the multi-host MCP instead, configure remote-workbench-ssh and select a host
+# explicitly in each tool call. Do not enable both servers for the same project.
+# [mcp_servers.remote-workbench-ssh]
+# command = "/absolute/path/to/remote-workbench/.venv/bin/remote-workbench-ssh"
+# args = ["--config", "/absolute/path/to/config.yaml"]

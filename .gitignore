@@ -1,0 +1,34 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+.env
+.env.*
+!.env.example
+*.egg
+.pytest_cache/
+.mypy_cache/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Remote Workbench runtime
+/config.yaml
+/workspace.json
+*.local.yaml
+*.local.json
+CLAUDE.md
+
+# Claude Code
+.claude/
+.remote-workbench-audit/
+.remote-workbench-state/
