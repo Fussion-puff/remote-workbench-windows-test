@@ -229,6 +229,52 @@ sys.exit(code)
 """
 
 
+def machine_identity():
+    value = {"node": os.uname().nodename, "boot_id": None}
+    try:
+        value["boot_id"] = Path("/proc/sys/kernel/random/boot_id").read_text().strip() or None
+    except OSError:
+        pass
+    return value
+
+
+def process_start(pid):
+    """A birth marker, never just PID existence. Missing proof means unknown."""
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return None
+    if Path("/proc").is_dir():
+        try:
+            data = Path(f"/proc/{pid}/stat").read_text()
+            fields = data[data.rindex(")") + 2:].split()
+            return "proc:" + fields[19] if fields[0] != "Z" else None
+        except (OSError, ValueError, IndexError):
+            return None
+    # BSD/macOS fallback. Linux cluster nodes use the stronger /proc marker.
+    try:
+        result = subprocess.run(["ps", "-p", str(pid), "-o", "lstart="],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=2)
+        return "ps:" + result.stdout.decode().strip() if result.returncode == 0 and result.stdout.strip() else None
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def job_liveness(origin):
+    current = machine_identity()
+    detail = {"origin_node": origin.get("node"), "observed_node": current["node"]}
+    if not isinstance(origin.get("node"), str) or not isinstance(origin.get("start_token"), str) or not origin["start_token"]:
+        return None, dict(detail, state_reason="identity_unavailable")
+    if origin["node"] != current["node"]:
+        return None, dict(detail, state_reason="different_node")
+    if origin.get("boot_id") and origin["boot_id"] != current["boot_id"]:
+        return None, dict(detail, state_reason="different_boot")
+    if origin["start_token"].startswith("proc:") and not origin.get("boot_id"):
+        return None, dict(detail, state_reason="boot_identity_unavailable")
+    observed = process_start(origin.get("pid"))
+    if observed != origin["start_token"]:
+        return None, dict(detail, state_reason="process_unconfirmed")
+    return True, {}
+
+
 def job(request):
     import re
     if not re.fullmatch(r"[a-zA-Z0-9_-]{1,80}", request["job_id"]):
@@ -252,22 +298,27 @@ def job(request):
         with open(path / "stdout.log", "wb", opener=lambda p, f: os.open(p, f, 0o600)) as out, open(path / "stderr.log", "wb", opener=lambda p, f: os.open(p, f, 0o600)) as err:
             process = subprocess.Popen([sys.executable, str(runner)], stdin=subprocess.DEVNULL,
                 stdout=out, stderr=err, start_new_session=True)
-        (path / "pid").write_text(str(process.pid))
-        return {"job_id": request["job_id"], "pid": process.pid, "job_dir": str(path)}
+        origin = dict(machine_identity(), version=1, pid=process.pid, start_token=process_start(process.pid))
+        atomic_write(path / "origin.json", json.dumps(origin).encode(), None)
+        atomic_write(path / "pid", str(process.pid).encode(), None)
+        return {"job_id": request["job_id"], "pid": process.pid, "job_dir": str(path), "node": origin["node"]}
     if not path.is_dir():
         return {"error": "job_not_found"}
     exit_path = path / "exit_code"
     if exit_path.exists():
         running, exit_code = False, int(exit_path.read_text())
+        detail = {}
     else:
         try:
-            os.kill(int((path / "pid").read_text()), 0)
-            running = True
-        except ProcessLookupError:
-            running = False
+            origin = json.loads((path / "origin.json").read_text())
+            if not isinstance(origin, dict):
+                origin = {}
+        except (OSError, ValueError):
+            origin = {}
+        running, detail = job_liveness(origin)
         exit_code = None
     result = {"job_id": request["job_id"], "running": running, "exit_code": exit_code,
-              "execution_state": "running" if running else ("finished" if exit_code is not None else "unknown")}
+              "execution_state": "running" if running else ("finished" if exit_code is not None else "unknown"), **detail}
     for stream in ("stdout", "stderr"):
         cursor = request[stream + "_cursor"]
         logfile = path / (stream + ".log")

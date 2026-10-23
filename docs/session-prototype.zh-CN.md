@@ -1,6 +1,6 @@
 # 按 Codex 对话路由的 Session 原型
 
-`0.3.0a1` 的 `remote-workbench-session` 是 develop 中的可选入口。它复用原有 SSH、文件、Git 和后台任务工具，保留 `remote-workbench-workspace` 与 `remote-workbench-ssh`。安装到独立 wheel 环境的日常版不会随开发源码改变。
+`remote-workbench-session` 从 `0.3.0a1` 起作为 develop 的可选入口，当前版本为 `0.3.0a2`。它复用原有 SSH、文件、Git 和后台任务工具，保留 `remote-workbench-workspace` 与 `remote-workbench-ssh`。安装到独立 wheel 环境的日常版不会随开发源码改变。
 
 ## 身份和首次绑定
 
@@ -18,19 +18,24 @@ workspace_switch(host="myserver", cwd="/absolute/path/to/project")
 
 ## 切换与执行
 
-新增的管理工具只有三个：
+工作区管理与观察工具：
 
 | 工具 | 行为 |
 | --- | --- |
 | `workspace_info()` | 读取当前绑定、revision、身份来源及允许的主机，不执行 SSH |
 | `workspace_switch(host, cwd, expected_revision=None)` | 验证目标、创建或恢复私有副本，然后原子切换 |
 | `workspace_history(limit=20)` | 读取本对话的目标切换历史，最新在前 |
+| `workspace_snapshot()` | 一次读取当前 Git 概况、本目标的历史测试证据及通信计量 |
 
 切换失败时，原绑定保持不变。`expected_revision` 可拒绝基于过时状态的切换。切回相同主机和规范化模板路径会恢复已保存的副本，不重新覆盖代码；重复选择当前目标是幂等操作。已保存目录消失或发生重定位时会报错，不会静默从模板重建。
 
 每次执行使用不可变快照。每个工作区的本机文件锁会串行化前台调用和目标切换，同一数据目录下的不同 MCP 进程也遵守该锁；等待超过 30 秒会提示当前存在前台操作。不同工作区可以并行。
 
 后台任务另存提交时的目标。切换后，`job_status(job_id)` 仍访问原服务器及原状态目录。job ID 在同一工作区内不能重新绑定到其他目标，不同工作区可以使用同名 job ID。SSH 提交结果不明时也保留原始目标，避免重试时误投递至另一台服务器。
+
+从 `0.3.0a2` 起，任务还记录实际节点与进程启动标识。Linux 使用 boot ID 和 `/proc` 启动时钟标识，其他 Unix 使用 `ps` 启动时间作尽力检查。节点变化、重启、PID 身份不符或旧任务缺少身份记录时，返回 `running=null, execution_state="unknown"`，而非根据同号 PID 猜测。若已有 supervisor 写出的退出码，则即使从其他共享文件系统节点读取，也可以报告该次任务完成。工具不自动切换到新节点或代查调度器。
+
+执行通道显式禁用 PTY，并在正常 mux 复用失败时使用不会连接网络的代理命令阻断 OpenSSH 的普通连接回退。Master 在检查后失效也不会触发新的 SSH 认证；用户仍通过普通终端完成认证。该设置不改变远端账号默认 shell 的选择及其启动文件。
 
 每条命令仍启动账号默认的登录 shell，不要求 zsh，也不自动延续上条命令的环境。需要的 Conda、venv 或模块环境应在同一命令中显式启用。这里不运行远端 Codex CLI，不提供操作系统级文件隔离。
 
@@ -61,7 +66,13 @@ SQLite 使用 WAL 和事务，绑定更新检查 revision。审计记录附带 t
 
 MCP 结果为一份紧凑 JSON 文本，不重复发送 structuredContent。命令预览默认 2 KiB，文件、补丁和 Git diff 预览默认 4 KiB；完整内容仍保存在本机。通常无需把 SSH 包装代码读回模型上下文。记录页仍是本机 HTML，不会因远端 cwd 改变而自动成为 Codex 的原生终端或原生 Git diff。
 
-本原型没有新增项目/聊天管理 UI，也没有实现本地与远端代码的双向同步。审计的 SQLite 元数据索引、全局 Session/Host 筛选 UI、Worker 内容缓存和日志配额属于后续工作。
+`workspace_snapshot` 中的 Git 状态是当次远端观察，包含时间、分支、HEAD 和变更文件数；超出统计界限时保留 `status_complete=false`，不把截断数据当成完整结果。它不会在普通工具调用时自动增加 Git 探测。
+
+`last_test` 按目标分别保存，来源是被识别为测试命令的退出结果；超时或传输状态不明时为 unknown。它同时返回 `evidence="command_exit_only", applies_to_current_code=null`：没有做代码指纹匹配，因此历史成功不能证明当前代码仍通过。切换到另一目标不会带过去旧目标的测试结果。
+
+通信计量保存在本机 SQLite，不增加额外 MCP 调用，也不存参数或输出正文。它记录完成的响应数量、已验证参数 JSON 的 UTF-8 字节数、返回文本字节数、失败结果和耗时。重复读取仅统计同一工作区内、同一保存输出页面的相同内容；增长中的日志返回新字节不算重复。Snapshot 的计量截至本次快照响应之前，不包含 JSON-RPC 外壳、工具 schema 或实际 tokenizer 成本，不等同于任务成功率。计量故障不会把已经执行的写入误报为失败。
+
+本原型没有新增项目/聊天管理 UI，也没有实现本地与远端代码的双向同步。完整审计元数据的 SQLite 索引、全局 Session/Host 筛选 UI、Worker 内容缓存和日志配额属于后续工作。
 
 ## 启动 develop 原型
 
@@ -91,3 +102,11 @@ args = ["--config", "/absolute/path/to/develop/hosts.yaml", "--data-dir", "/abso
 自动测试通过真实 Python MCP 客户端向 stdio 服务传入 metadata，验证 SDK 注入、工具 schema、进程重启、双对话隔离、切换和任务来源；这与 App 亲自发出 metadata 是两项不同的验证。
 
 App 联调时，仅启用 develop 原型，在两个聊天中分别调用 `workspace_info()`：应看到不同 workspace_id，同一聊天重载 MCP 后应恢复同一个 workspace_id。如果 App 没有转发 threadId，应收到明确的身份错误。此时不要用 sessionId、PID、用户手填 ID 或默认目录绕过。未完成真实 App 的这一检查前，不替换日常版。
+
+也可先用只读诊断模式单独联调，不启用任何远端工具：
+
+```sh
+remote-workbench-session --identity-probe --data-dir /absolute/path/to/develop/identity-data --viewer-port 8771
+```
+
+此模式只暴露无参数的 `session_identity_probe`。它不读取主机配置、不建立 SSH、不创建或选择 Workspace，仅返回实际 MCP 请求中的身份是否可用及字段名，并保存本机记录。其他 metadata 的值不会写入记录。App 设置中出现服务器条目、或本机端口已启动，都不能代替真实的 tool call 验证；修改配置后，已开始回合的工具清单也可能仍需在后续回合刷新。

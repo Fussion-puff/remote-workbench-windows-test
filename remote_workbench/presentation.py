@@ -22,6 +22,8 @@ _STATE_LABELS = {
 }
 
 _TOOL_TITLES = {
+    "workspace_snapshot": "查看工程快照",
+    "session_identity_probe": "检查对话身份",
     "workspace_switch": "切换工作区",
     "prepare_workspace": "创建 session 工程副本",
     "ssh_check_connection": "检查远端连接",
@@ -56,6 +58,10 @@ _TEST_COMMAND = re.compile(
     r"go\s+test\b|cargo\s+test\b|npm\s+test\b|pnpm\s+test\b|yarn\s+test\b)",
     re.IGNORECASE,
 )
+
+
+def is_test_command(command):
+    return bool(_TEST_COMMAND.search(command))
 
 _UNITTEST_SUMMARY = re.compile(
     r"(?m)^Ran\s+(\d+)\s+tests?\s+in\s+([0-9]+(?:\.[0-9]+)?)s[ \t]*\r?\n"

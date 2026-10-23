@@ -6,4 +6,6 @@ The Remote Workbench changes in this source tree were made on 2026-10-23 and 202
 
 The 0.3.0a1 development prototype adds opt-in request-metadata thread routing, a local SQLite workspace registry, immutable execution snapshots, private target switching and restoration, persistent job origins, and workspace-scoped audit routes. Existing fixed-workspace and explicit-host entry points remain available.
 
+The 0.3.0a2 development changes add a local identity-only MCP diagnostic, block fresh SSH connection fallback after mux loss, verify background-job node and process birth identity, and add explicit Git snapshots with target-scoped test evidence and communication-byte accounting.
+
 The upstream README is preserved in [README.upstream.md](README.upstream.md). The [LICENSE](LICENSE) is preserved. This derivative is distributed under GNU AGPL version 3; retain upstream copyright, license, and warranty notices when redistributing it. This provenance notice identifies the source lineage and does not claim authorship of upstream work.

@@ -56,7 +56,9 @@ async def test_budget_and_full_spool(local):
 @pytest.mark.asyncio
 async def test_timeout_retains_output_and_unknown_state(local):
     executor, _ = local
-    result = await executor.run("printf partial; exec sleep 2", timeout=0.2)
+    # Include enough time for native shell/Python startup before interrupting
+    # the command; a 200 ms startup deadline cannot promise any stdout yet.
+    result = await executor.run("printf partial; exec sleep 10", timeout=2)
     assert result.timed_out and result.execution_state == 'remote_state_unknown'
     assert (audit.directory(result.output_id)/'stdout').read_text() == 'partial'
 

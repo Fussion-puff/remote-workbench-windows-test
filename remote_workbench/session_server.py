@@ -3,11 +3,14 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import asdict
+import hashlib
 import inspect
 import json
 from pathlib import Path
 import re
+import sqlite3
 import sys
+import time
 import uuid
 
 from mcp.server.fastmcp import Context, FastMCP
@@ -16,13 +19,45 @@ from mcp.server.fastmcp.exceptions import ToolError
 from remote_workbench import audit
 from remote_workbench.audit_web import handler_for_workspaces
 from remote_workbench.config import load_config
-from remote_workbench.session_context import get_codex_identity
+from remote_workbench.session_context import get_codex_identity, request_metadata, SessionIdentityUnavailable
 from remote_workbench.workspace import TOOLS, bind_tool, _local_audit_viewer
 from remote_workbench.workspace_router import SessionRouter, default_state_dir
 from remote_workbench.workspace_registry import WorkspaceTarget
+from remote_workbench.presentation import is_test_command
+from remote_workbench.workspace_snapshot import collect as collect_snapshot
 
 _LOCAL_TOOLS = {"audit_list", "audit_get", "read_output"}
 _BUDGETS = {"exec_command": 2048, "read_file": 4096, "patch_file": 4096, "git_diff": 4096}
+
+
+def create_identity_probe(*, viewer_url: str | None = None, audit_dir: Path) -> FastMCP:
+    """A local diagnostic with no host configuration or remote execution tools."""
+    server = FastMCP("remote-workbench-identity-probe", instructions=(
+        "Read-only local MCP metadata diagnostic. session_identity_probe reports the conversation "
+        "identity supplied by the actual client. It does not connect to SSH or select a workspace. "
+        "Include the returned operation_log link in your user-facing result."
+    ))
+
+    @server.tool(structured_output=False)
+    async def session_identity_probe(ctx: Context) -> str:
+        meta = request_metadata(ctx)
+        result = {"identity_available": False, "identity_source": "mcp._meta.threadId",
+                  "metadata_keys": sorted(k for k in meta if isinstance(k, str))[:32],
+                  "remote_execution": False}
+        try:
+            identity = get_codex_identity(ctx)
+            result.update(identity_available=True, thread_id=identity.thread_id,
+                          client_session_id=identity.session_id)
+        except SessionIdentityUnavailable:
+            result["message"] = "The client did not supply a usable threadId; session routing remains disabled"
+        with audit.scoped_root(audit_dir):
+            record = audit.create(kind="tool", tool="session_identity_probe", status="finished", **result)
+            result["operation_id"] = record
+            if viewer_url:
+                result["operation_log"] = f"[**Remote Workbench 操作记录**]({viewer_url}/?id={record})"
+        return json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+
+    return server
 
 
 def create_server(router: SessionRouter, *, viewer_url: str | None = None) -> FastMCP:
@@ -64,6 +99,42 @@ def create_server(router: SessionRouter, *, viewer_url: str | None = None) -> Fa
     async def history(state, identity, limit=20):
         return {"targets": router.registry.history(state.workspace_id, limit)}
 
+    async def workspace_snapshot(state, identity):
+        snapshot = router.snapshot(state)
+        record = audit.create(kind="tool", tool="workspace_snapshot", host=snapshot.host,
+                              cwd=snapshot.cwd, status="running")
+        token = audit.operation_id.set(record)
+        try:
+            result = await collect_snapshot(snapshot)
+            result["last_test"] = router.registry.last_test(state.workspace_id, snapshot.target_id)
+            result["communication"] = router.registry.metrics(state.workspace_id)
+            result["communication"]["scope"] = "recorded_workspace_responses_before_this_call"
+            result["operation_id"] = record
+            audit.update(record, status="finished", output_id=result["output_id"])
+            return result
+        except BaseException as exc:
+            audit.update(record, status="failed", error=str(exc))
+            raise
+        finally:
+            audit.operation_id.reset(token)
+
+    def record_metrics(state, name, arguments, text, started, *, result=None, failed=False):
+        read_key = None
+        if name == "read_output" and result is not None:
+            # Repeat detection concerns identical saved-output pages only.
+            # New bytes appended to a running stream produce a different key.
+            fields = [arguments.get("output_id"), arguments.get("stream"),
+                      arguments.get("cursor"), result.get("content")]
+            read_key = hashlib.sha256(json.dumps(fields, ensure_ascii=False).encode()).hexdigest()
+        try:
+            router.registry.record_call(state.workspace_id, name,
+                len(json.dumps(arguments, ensure_ascii=False, separators=(",", ":")).encode()),
+                len(text.encode()), round((time.monotonic() - started) * 1000), failed, read_key)
+        except (sqlite3.Error, OSError):
+            # An accounting failure must not turn an already executed write
+            # into an apparent tool failure that invites a dangerous retry.
+            print("Remote Workbench communication accounting unavailable", file=sys.stderr)
+
     async def switch(state, identity, host: str, cwd: str, expected_revision: int | None = None):
         record = audit.create(kind="tool", tool="workspace_switch", status="running",
                               arguments={"host": host, "cwd": cwd, "expected_revision": expected_revision})
@@ -88,6 +159,7 @@ def create_server(router: SessionRouter, *, viewer_url: str | None = None) -> Fa
             return_annotation=str)
 
         async def invoke(**kwargs):
+            started = time.monotonic()
             bound = signature.bind(**kwargs)
             bound.apply_defaults()
             arguments = dict(bound.arguments)
@@ -107,11 +179,17 @@ def create_server(router: SessionRouter, *, viewer_url: str | None = None) -> Fa
                                     client_session_id=identity.session_id)
                     with audit.scoped_root(directory), audit.scoped_metadata(**metadata):
                         result = await execute(state, identity, **arguments)
-                        return pack(result, router.registry.get(state.workspace_id))
+                        text = pack(result, router.registry.get(state.workspace_id))
+                        failed = bool(result.get("error") or result.get("timed_out") or
+                                      result.get("exit_code") not in (None, 0))
+                        record_metrics(state, name, arguments, text, started, result=result, failed=failed)
+                        return text
             except Exception as exc:
                 url = workspace_url(state)
                 link = f"\n\n[**Remote Workbench 操作记录**]({url})" if url else ""
-                raise ToolError(str(exc) + link) from exc
+                text = str(exc) + link
+                record_metrics(state, name, arguments, text, started, failed=True)
+                raise ToolError(text) from exc
 
         invoke.__name__ = name
         invoke.__doc__ = description
@@ -123,6 +201,7 @@ def create_server(router: SessionRouter, *, viewer_url: str | None = None) -> Fa
     for name, function, description in (
         ("workspace_info", info, "Inspect this thread's persistent workspace and metadata identity. No remote execution."),
         ("workspace_history", history, "Read this thread's previous host/source-directory bindings, newest first."),
+        ("workspace_snapshot", workspace_snapshot, "Inspect current remote Git state, last test evidence for this target, and measured response bytes. Last test evidence does not certify the current code."),
         ("workspace_switch", switch, "Validate a configured host/source cwd, create or resume a private project copy, then atomically switch. Old jobs keep their original target."),
     ):
         signature = inspect.signature(function, eval_str=True)
@@ -154,7 +233,18 @@ def create_server(router: SessionRouter, *, viewer_url: str | None = None) -> Fa
                 router.registry.register_job(state.workspace_id, job_id, origin)
             tool = bind_tool(snapshot.workspace, _name, _function, "")
             with audit.scoped_metadata(**snapshot.metadata(), client_session_id=identity.session_id):
-                return await tool(**arguments)
+                result = await tool(**arguments)
+            if _name == "exec_command" and is_test_command(arguments["command"]):
+                state_known = result.get("execution_state") == "finished" and not result.get("timed_out")
+                observation = {"operation_id": result.get("operation_id"), "exit_code": result.get("exit_code"),
+                    "status": ("passed" if result.get("exit_code") == 0 else "failed") if state_known else "unknown",
+                    "observed_at": time.time(), "revision": state.revision,
+                    "evidence": "command_exit_only", "applies_to_current_code": None}
+                try:
+                    router.registry.save_test(state.workspace_id, snapshot.target_id, observation)
+                except (sqlite3.Error, OSError):
+                    print("Remote Workbench test observation unavailable", file=sys.stderr)
+            return result
 
         register(name, public, description, execute)
     return server
@@ -165,7 +255,14 @@ def main():
     parser.add_argument("--config", help="Host allowlist YAML; uses the normal Remote Workbench configuration by default")
     parser.add_argument("--data-dir", type=Path, default=default_state_dir(), help="Private local registry/audit directory")
     parser.add_argument("--viewer-port", type=int, default=8769, help="Preferred localhost viewer port; falls back if occupied")
+    parser.add_argument("--identity-probe", action="store_true", help="Expose only a local metadata diagnostic, without host configuration or remote tools")
     args = parser.parse_args()
+    if args.identity_probe:
+        directory = args.data_dir.expanduser().resolve() / "identity-probe"
+        with _local_audit_viewer(args.viewer_port, audit_dir=directory) as viewer:
+            url = f"http://127.0.0.1:{viewer.server_port}"
+            create_identity_probe(viewer_url=url, audit_dir=directory).run()
+        return
     router = SessionRouter(load_config(args.config), args.data_dir)
     with _local_audit_viewer(args.viewer_port, handler=handler_for_workspaces(router.state_dir / "audit")) as viewer:
         url = f"http://127.0.0.1:{viewer.server_port}"

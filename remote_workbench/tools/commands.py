@@ -46,6 +46,8 @@ async def ssh_job_status(job_id: str, tail_lines: int = 50, host: str | None = N
 
     tail_lines is a compatibility display cap; cursors count bytes in the remote
     logs. Per-stream pages are limited to max_bytes/2 before the display line cap.
+    running=None and execution_state='unknown' mean node/process identity could
+    not be verified. Missing completion is never proof that a job has stopped.
     """
     if not _SAFE_JOB_ID.fullmatch(job_id):
         return {"error": "invalid_job_id"}

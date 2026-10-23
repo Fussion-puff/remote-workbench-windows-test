@@ -2,6 +2,7 @@ import asyncio
 from pathlib import Path
 import json
 import subprocess
+import sqlite3
 from unittest.mock import AsyncMock
 
 import pytest
@@ -38,7 +39,7 @@ async def test_schema_context_injection_and_missing_identity_fail_closed(tmp_pat
     router = router_at(tmp_path)
     server = create_server(router)
     tools = await server.list_tools()
-    assert len(tools) == 18
+    assert len(tools) == 19
     for tool in tools:
         fields = tool.inputSchema["properties"]
         assert not {"ctx", "thread_id", "threadId", "workspace_id", "session_id"} & fields.keys()
@@ -164,3 +165,55 @@ async def test_switch_waits_for_foreground_call_across_router_instances(project)
     result, switched = await asyncio.gather(first, switching)
     assert result["stdout"].strip() == state["cwd"]
     assert switched["host"] == "b"
+
+
+async def test_snapshot_test_scope_and_response_byte_accounting(project):
+    router, server, source, other = project
+    (source / ".gitignore").write_text("__pycache__/\n.remote-workbench-state/\n")
+    (source / "tests").mkdir()
+    (source / "tests/test_one.py").write_text("import unittest\nclass Check(unittest.TestCase):\n def test_one(self): self.assertEqual(1+1,2)\n")
+    subprocess.run(["git", "init", "-q", str(source)], check=True)
+    subprocess.run(["git", "-C", str(source), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(source), "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "baseline"], check=True)
+    state = await call(server, "a", "workspace_switch", host="a", cwd=str(source))
+    workspace_id = state["workspace_id"]
+    before = router.registry.metrics(workspace_id)
+    output = await call(server, "a", "exec_command", command="printf '你好'")
+    after = router.registry.metrics(workspace_id)
+    expected = len(json.dumps(output, ensure_ascii=False, separators=(",", ":")).encode())
+    assert after["result_text_bytes"] - before["result_text_bytes"] == expected
+    assert after["recorded_responses"] - before["recorded_responses"] == 1
+    await call(server, "a", "read_output", output_id=output["output_id"], max_bytes=256)
+    await call(server, "a", "read_output", output_id=output["output_id"], max_bytes=256)
+    assert router.registry.metrics(workspace_id)["repeated_output_reads"] == 1
+    with audit.scoped_root(router.audit_dir(workspace_id)):
+        with (audit.directory(output["output_id"]) / "stdout").open("ab") as stream:
+            stream.write(b"new")  # Simulate a growing saved output stream.
+    await call(server, "a", "read_output", output_id=output["output_id"], max_bytes=256)
+    assert router.registry.metrics(workspace_id)["repeated_output_reads"] == 1
+    tested = await call(server, "a", "exec_command", command="python3 -m unittest discover -s tests -v")
+    assert tested["exit_code"] == 0
+    renamed = await call(server, "a", "exec_command", command="git mv value.txt renamed.txt")
+    assert renamed["exit_code"] == 0
+    snapshot = await call(server, "a", "workspace_snapshot")
+    assert snapshot["git"]["modified_files"] == 1 and snapshot["git"]["status_complete"]
+    assert snapshot["last_test"]["operation_id"] == tested["operation_id"]
+    assert snapshot["last_test"]["status"] == "passed"
+    assert snapshot["last_test"]["applies_to_current_code"] is None
+    assert snapshot["communication"]["recorded_responses"] > 0
+    await call(server, "a", "workspace_switch", host="b", cwd=str(other))
+    assert (await call(server, "a", "workspace_snapshot"))["last_test"] is None
+    restarted = create_server(router_at(router.state_dir))
+    await call(restarted, "a", "workspace_switch", host="a", cwd=str(source))
+    assert (await call(restarted, "a", "workspace_snapshot"))["last_test"]["operation_id"] == tested["operation_id"]
+
+
+async def test_accounting_failure_does_not_turn_a_completed_write_into_failure(project, monkeypatch):
+    router, server, source, _ = project
+    state = await call(server, "a", "workspace_switch", host="a", cwd=str(source))
+    def broken(*args, **kwargs):
+        raise sqlite3.OperationalError("accounting unavailable")
+    monkeypatch.setattr(router.registry, "record_call", broken)
+    result = await call(server, "a", "write_file", path="value.txt", content="written once\n")
+    assert result.get("success")
+    assert Path(state["cwd"], "value.txt").read_text() == "written once\n"

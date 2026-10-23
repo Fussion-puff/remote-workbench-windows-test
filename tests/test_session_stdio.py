@@ -28,3 +28,18 @@ async def test_real_stdio_metadata_and_process_restart(tmp_path):
                 return a["workspace_id"], b["workspace_id"]
 
     assert await inspect_process() == await inspect_process()
+
+
+async def test_identity_only_cli_does_not_load_hosts_or_remote_tools(tmp_path):
+    params = StdioServerParameters(command=sys.executable, args=[
+        "-m", "remote_workbench.session_server", "--identity-probe", "--config", "/does/not/exist.yaml",
+        "--data-dir", str(tmp_path), "--viewer-port", "19869"])
+    async with stdio_client(params) as (reader, writer):
+        async with ClientSession(reader, writer) as client:
+            await client.initialize()
+            tools = await client.list_tools()
+            assert [tool.name for tool in tools.tools] == ["session_identity_probe"]
+            result = await client.call_tool("session_identity_probe", meta={"threadId": "test-client-only"})
+            value = json.loads(result.content[0].text)
+            assert value["identity_available"] and value["remote_execution"] is False
+            assert (tmp_path / "identity-probe" / value["operation_id"] / "record.json").exists()

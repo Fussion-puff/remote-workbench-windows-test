@@ -118,6 +118,19 @@ class Registry:
                     "CREATE INDEX IF NOT EXISTS target_history_recent "
                     "ON target_history(workspace_id, revision DESC)"
                 )
+                db.execute("""CREATE TABLE IF NOT EXISTS call_metrics (
+                    id INTEGER PRIMARY KEY, workspace_id TEXT NOT NULL REFERENCES workspaces(workspace_id),
+                    tool TEXT NOT NULL, argument_bytes INTEGER NOT NULL, result_bytes INTEGER NOT NULL,
+                    duration_ms INTEGER NOT NULL, failed INTEGER NOT NULL,
+                    read_key TEXT, repeated_read INTEGER NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )""")
+                db.execute("CREATE INDEX IF NOT EXISTS call_metrics_workspace ON call_metrics(workspace_id)")
+                db.execute("CREATE INDEX IF NOT EXISTS call_metrics_reads ON call_metrics(workspace_id, read_key)")
+                db.execute("""CREATE TABLE IF NOT EXISTS last_tests (
+                    workspace_id TEXT NOT NULL REFERENCES workspaces(workspace_id), target_id TEXT NOT NULL,
+                    observation TEXT NOT NULL, PRIMARY KEY(workspace_id, target_id)
+                )""")
                 db.commit()
             except BaseException:
                 db.rollback()
@@ -364,3 +377,38 @@ class Registry:
             cwd=row["cwd"],
             project_root=row["project_root"],
         )
+
+    def record_call(self, workspace_id, tool, argument_bytes, result_bytes, duration_ms, failed, read_key=None):
+        with self._transaction() as db:
+            repeated = bool(read_key) and db.execute(
+                "SELECT 1 FROM call_metrics WHERE workspace_id=? AND read_key=? LIMIT 1",
+                (workspace_id, read_key)).fetchone() is not None
+            db.execute("""INSERT INTO call_metrics
+                (workspace_id,tool,argument_bytes,result_bytes,duration_ms,failed,read_key,repeated_read)
+                VALUES (?,?,?,?,?,?,?,?)""", (workspace_id, tool, argument_bytes, result_bytes,
+                                               duration_ms, int(failed), read_key, int(repeated)))
+
+    def metrics(self, workspace_id):
+        with self._connection() as db:
+            row = db.execute("""SELECT COUNT(*) AS recorded_responses,
+                COALESCE(SUM(argument_bytes),0) AS validated_argument_bytes,
+                COALESCE(SUM(result_bytes),0) AS result_text_bytes,
+                COALESCE(SUM(failed),0) AS failed_results,
+                COALESCE(SUM(repeated_read),0) AS repeated_output_reads,
+                COALESCE(SUM(duration_ms),0) AS total_duration_ms
+                FROM call_metrics WHERE workspace_id=?""", (workspace_id,)).fetchone()
+        return dict(row)
+
+    def save_test(self, workspace_id, target_id, observation):
+        import json
+        with self._transaction() as db:
+            db.execute("""INSERT INTO last_tests(workspace_id,target_id,observation) VALUES (?,?,?)
+                ON CONFLICT(workspace_id,target_id) DO UPDATE SET observation=excluded.observation""",
+                (workspace_id, target_id, json.dumps(observation, separators=(",", ":"))))
+
+    def last_test(self, workspace_id, target_id):
+        import json
+        with self._connection() as db:
+            row = db.execute("SELECT observation FROM last_tests WHERE workspace_id=? AND target_id=?",
+                             (workspace_id, target_id)).fetchone()
+        return json.loads(row[0]) if row else None

@@ -59,6 +59,7 @@ class SSHExecutor:
         if not force and self._last_check_ok and (now - self._last_check) < _CHECK_CACHE_TTL:
             return True, "Connection OK (cached)"
 
+        proc = None
         try:
             proc = await asyncio.create_subprocess_exec(
                 "ssh",
@@ -70,11 +71,20 @@ class SSHExecutor:
             )
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=5.0)
         except asyncio.TimeoutError:
+            if proc is not None and proc.returncode is None:
+                proc.kill()
+                await proc.wait()
             self._last_check_ok = False
             return False, "SSH connection check timed out."
         except FileNotFoundError:
             self._last_check_ok = False
             return False, "ssh binary not found. Ensure OpenSSH is installed."
+        except BaseException:
+            if proc is not None and proc.returncode is None:
+                proc.kill()
+                await proc.wait()
+            self._last_check_ok = False
+            raise
 
         output = (stdout.decode() + stderr.decode()).strip()
 
@@ -134,9 +144,15 @@ class SSHExecutor:
 
         ssh_args = [
             "ssh",
+            "-T",
             "-S", self._control_path,
             "-o", "ControlMaster=no",
             "-o", "BatchMode=yes",
+            # OpenSSH normally falls back to a new connection when a master
+            # disappears, even after a successful -O check. An inert proxy is
+            # consulted only on that fallback path: an existing mux channel
+            # works normally, but fallback cannot dial/authenticate anywhere.
+            "-o", "ProxyCommand=false",
         ]
         if self.config.port != 22:
             ssh_args.extend(["-p", str(self.config.port)])
@@ -340,10 +356,13 @@ def _is_ssh_error(stderr: str) -> bool:
         "Connection refused",
         "Connection reset by peer",
         "Connection closed by remote host",
+        "Connection closed by UNKNOWN",
         "Control socket connect",
         "mux_client_request_session",
         "Host key verification failed",
         "Could not resolve hostname",
+        "kex_exchange_identification",
+        "ssh_exchange_identification",
     ]
     stderr_lower = stderr.lower()
     return any(ind.lower() in stderr_lower for ind in indicators)

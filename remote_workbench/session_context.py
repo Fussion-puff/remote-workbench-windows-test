@@ -21,7 +21,7 @@ class SessionIdentity:
     item_id: str | None = None
 
 
-def get_codex_identity(ctx: Context) -> SessionIdentity:
+def request_metadata(ctx: Context) -> dict:
     try:
         meta = ctx.request_context.meta
     except (AttributeError, LookupError, ValueError):
@@ -30,6 +30,11 @@ def get_codex_identity(ctx: Context) -> SessionIdentity:
         meta = meta.model_dump(by_alias=True, exclude_none=True)
     if not isinstance(meta, dict):
         meta = {}
+    return meta
+
+
+def get_codex_identity(ctx: Context) -> SessionIdentity:
+    meta = request_metadata(ctx)
 
     def identifier(key):
         value = meta.get(key)
