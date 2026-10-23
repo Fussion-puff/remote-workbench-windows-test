@@ -281,6 +281,9 @@ main{display:grid;grid-template-columns:minmax(250px,310px) minmax(0,1fr);height
   function outputSourceStream(stream) {
     return stream === 'diff' && selectedRecord && selectedRecord.arguments && selectedRecord.arguments.mode === 'patch' ? 'stdout' : stream;
   }
+  function emptyOutputText(stream) {
+    return stream === 'diff' ? '无改动' : '（当前没有这类输出）';
+  }
   async function loadOutput(reset, append=false) {
     if (!selected) return;
     if (reset) { cursor = 0; renderContent('', false); showSummary('output',null); }
@@ -295,12 +298,13 @@ main{display:grid;grid-template-columns:minmax(250px,310px) minmax(0,1fr);height
       if (value.summary) showSummary('output',value.summary);
       el('next').disabled = !value.truncated;
       el('output-meta').textContent = value.total_bytes.toLocaleString() + ' 字节' + (value.truncated ? ' · 尚有后续内容' : ' · 已显示完整内容');
-      if (!value.total_bytes && !el('output').textContent) el('output').textContent = '（当前没有这类输出）';
+      if (!value.total_bytes && !el('output').textContent) el('output').textContent = emptyOutputText(requestStream);
     } catch (error) {
       if (selected !== requestId || activeStream !== requestStream) return;
-      el('output').textContent = '（当前没有这类输出）';
+      const missingOutput = /not found|no such file or directory/i.test(error.message);
+      el('output').textContent = missingOutput ? emptyOutputText(requestStream) : '（当前没有这类输出）';
       el('next').disabled = true; el('output-meta').textContent = '';
-      if (!/not found/i.test(error.message)) el('message').textContent = error.message;
+      if (!missingOutput) el('message').textContent = error.message;
     }
   }
   async function loadRaw(reset=false) {
