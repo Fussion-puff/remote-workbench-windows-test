@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import contextvars
+import fcntl
 import json
 import os
 import re
@@ -12,6 +13,7 @@ from pathlib import Path
 
 operation_id = contextvars.ContextVar("operation_id", default=None)
 _scoped_root = contextvars.ContextVar("audit_root", default=None)
+_metadata = contextvars.ContextVar("audit_metadata", default=None)
 _ID = re.compile(r"^[a-f0-9]{32}$")
 STREAMS = {"stdout", "stderr", "stdin", "diff", "startup_stdout", "startup_stderr"}
 
@@ -39,6 +41,16 @@ def scoped_root(path):
         _scoped_root.reset(token)
 
 
+@contextmanager
+def scoped_metadata(**values):
+    """Attach an immutable request's identity to every child record it creates."""
+    token = _metadata.set(dict(values))
+    try:
+        yield
+    finally:
+        _metadata.reset(token)
+
+
 def root() -> Path:
     path = _scoped_root.get()
     if path is None:
@@ -56,25 +68,34 @@ def directory(record_id: str) -> Path:
 def create(**metadata) -> str:
     record_id = uuid.uuid4().hex
     directory(record_id).mkdir(mode=0o700)
-    update(record_id, id=record_id, created_at=time.time(), **metadata)
+    update(record_id, id=record_id, created_at=time.time(), **dict(metadata, **(_metadata.get() or {})))
     return record_id
 
 
-def update(record_id: str, **values) -> None:
+def _edit(record_id: str, change) -> None:
     path = directory(record_id) / "record.json"
-    current = json.loads(path.read_text()) if path.exists() else {}
-    current.update(values)
-    temporary = path.with_suffix(".tmp")
-    with open(temporary, "w", encoding="utf-8", opener=lambda p, f: os.open(p, f, 0o600)) as output:
-        json.dump(current, output, ensure_ascii=False, indent=2, default=str)
-    temporary.replace(path)
+    lock = os.open(path.parent / ".record.lock", os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    temporary = path.with_name(".record-" + uuid.uuid4().hex + ".tmp")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        current = json.loads(path.read_text()) if path.exists() else {}
+        change(current)
+        with open(temporary, "x", encoding="utf-8", opener=lambda p, f: os.open(p, f, 0o600)) as output:
+            json.dump(current, output, ensure_ascii=False, indent=2, default=str)
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+        os.close(lock)
+
+
+def update(record_id: str, **values) -> None:
+    _edit(record_id, lambda current: current.update(values))
 
 
 def add_child(parent_id: str | None, child_id: str) -> None:
     if parent_id:
-        path = directory(parent_id) / "record.json"
-        metadata = json.loads(path.read_text())
-        update(parent_id, child_commands=metadata.get("child_commands", []) + [child_id])
+        _edit(parent_id, lambda current: current.update(
+            child_commands=current.get("child_commands", []) + [child_id]))
 
 
 def open_stream(record_id: str, stream: str):
@@ -130,7 +151,7 @@ def recent(limit=50) -> list[dict]:
     for path in paths[:min(200, max(1, limit))]:
         try:
             value = json.loads(path.read_text())
-            result.append({k: value[k] for k in ("id", "kind", "tool", "parent_id", "host", "cwd", "created_at", "status", "exit_code", "elapsed_ms") if k in value})
+            result.append({k: value[k] for k in ("id", "kind", "tool", "parent_id", "host", "cwd", "created_at", "status", "exit_code", "elapsed_ms", "thread_id", "workspace_id", "revision", "target_id") if k in value})
         except (OSError, ValueError):
             continue
     return result

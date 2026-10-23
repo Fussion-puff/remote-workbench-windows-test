@@ -8,6 +8,8 @@ This is an independently maintained derivative of [Onirika](https://github.com/x
 
 本机开发环境与日常稳定版的隔离、安装和切换方式见[开发与稳定版部署](docs/development.zh-CN.md)。
 
+Develop also includes an opt-in `remote-workbench-session` prototype (0.3.0a1): persistent workspaces routed by MCP `_meta.threadId`, atomic host/directory switching, and jobs pinned to their original targets. Each thread keeps its own remote project copies. This does not change an independently installed stable release; see [Session 原型与客户端联调边界](docs/session-prototype.zh-CN.md).
+
 ## Use a remote project as the default environment
 
 The recommended entry point, `remote-workbench-workspace`, binds one local MCP process to a host and an absolute remote template directory. Its tools omit the host parameter and resolve relative paths from that process's private project copy. Copy [workspace.example.json](workspace.example.json), then set `host` to an alias from your local SSH configuration and `cwd` to the remote project template.

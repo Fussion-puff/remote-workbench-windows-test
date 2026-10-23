@@ -244,7 +244,7 @@ def create_server(workspace: Workspace, *, viewer_url: str | None = None, sessio
 
 
 @contextmanager
-def _local_audit_viewer(port: int | None, *, audit_dir=None):
+def _local_audit_viewer(port: int | None, *, audit_dir=None, handler=None):
     """Optionally serve the audit viewer on loopback for this MCP lifetime."""
     if port is None:
         yield None
@@ -252,7 +252,7 @@ def _local_audit_viewer(port: int | None, *, audit_dir=None):
     if isinstance(port, bool) or not 1 <= port <= 65535:
         raise ValueError("viewer port must be between 1 and 65535")
 
-    handler = handler_for_directory(audit_dir) if audit_dir is not None else AuditViewerHandler
+    handler = handler or (handler_for_directory(audit_dir) if audit_dir is not None else AuditViewerHandler)
     try:
         viewer = ThreadingHTTPServer(("127.0.0.1", port), handler)
     except OSError as exc:

@@ -2,6 +2,7 @@
 import argparse
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from remote_workbench import audit
@@ -46,7 +47,8 @@ main{display:grid;grid-template-columns:minmax(250px,310px) minmax(0,1fr);height
   let selected = '', activeStream = 'stdout', cursor = 0, rawCursor = 0, selectedRecord = null, polling = false, timer = null, diffState = {old:null,next:null,oldRemaining:0,nextRemaining:0,inHunk:false,pending:''};
   const buttons = new Map();
   async function get(url) {
-    const response = await fetch(url, {cache:'no-store'});
+    const workspacePrefix = location.pathname.match(/^\/w\/[a-f0-9]{32}(?=\/)/);
+    const response = await fetch((workspacePrefix ? workspacePrefix[0] : '') + url, {cache:'no-store'});
     let value;
     try { value = await response.json(); } catch (_) { throw Error('HTTP ' + response.status); }
     if (!response.ok) throw Error(value.error || ('HTTP ' + response.status));
@@ -578,6 +580,24 @@ def handler_for_directory(path):
                 super().do_GET()
 
     return ScopedHandler
+
+
+def handler_for_workspaces(path):
+    """One viewer with explicit, isolated /w/<workspace UUID>/ routes."""
+    import re
+    base = Path(path)
+
+    class WorkspaceHandler(Handler):
+        def do_GET(self):
+            match = re.match(r"^/w/([a-f0-9]{32})(/.*)$", self.path)
+            if match is None or not (base / match[1]).is_dir():
+                self._send_json({"error": "Use the operation_log link for a known workspace"}, 404)
+                return
+            self.path = match[2]
+            with audit.scoped_root(base / match[1]):
+                super().do_GET()
+
+    return WorkspaceHandler
 
 
 def main():

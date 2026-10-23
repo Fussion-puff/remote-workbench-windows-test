@@ -22,6 +22,7 @@ _STATE_LABELS = {
 }
 
 _TOOL_TITLES = {
+    "workspace_switch": "切换工作区",
     "prepare_workspace": "创建 session 工程副本",
     "ssh_check_connection": "检查远端连接",
     "ssh_run_background": "启动后台任务",
