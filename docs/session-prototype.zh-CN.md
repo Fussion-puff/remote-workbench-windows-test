@@ -93,6 +93,8 @@ command = "/absolute/path/to/develop/.venv/bin/remote-workbench-session"
 args = ["--config", "/absolute/path/to/develop/hosts.yaml", "--data-dir", "/absolute/path/to/develop/session-data", "--viewer-port", "8770"]
 ```
 
+如只在开发项目联调，可将此表放入已信任项目的 `.codex/config.toml`，将 `enabled` 改为 `true`，并加上 `required = true`，让客户端等待该服务初始化。这样其他项目无需加载这组原型工具。包含个人绝对路径的项目配置应排除出 Git。保存后通过 App 的 Restart 加载新工具；日常版使用原有独立配置。
+
 原型不改变客户端的进程管理。客户端可以让不同聊天启动不同 stdio 进程，也可以向同一个进程发送多个 threadId；两种情况均按同一个 SQLite Registry 路由。仅使用 stdio 配置不能保证 App 自动共享一个 MCP 进程。本阶段没有新增常驻 HTTP MCP 服务。
 
 ## 客户端联调边界
@@ -101,7 +103,9 @@ args = ["--config", "/absolute/path/to/develop/hosts.yaml", "--data-dir", "/abso
 
 自动测试通过真实 Python MCP 客户端向 stdio 服务传入 metadata，验证 SDK 注入、工具 schema、进程重启、双对话隔离、切换和任务来源；这与 App 亲自发出 metadata 是两项不同的验证。
 
-App 联调时，仅启用 develop 原型，在两个聊天中分别调用 `workspace_info()`：应看到不同 workspace_id，同一聊天重载 MCP 后应恢复同一个 workspace_id。如果 App 没有转发 threadId，应收到明确的身份错误。此时不要用 sessionId、PID、用户手填 ID 或默认目录绕过。未完成真实 App 的这一检查前，不替换日常版。
+App 联调时，将 develop 原型作为独立 MCP 启用，保留日常版配置，显式使用原型的工具。在两个聊天中分别调用 `workspace_info()`：应看到不同 workspace_id，同一聊天重载 MCP 后应恢复同一个 workspace_id。如果 App 没有转发 threadId，应收到明确的身份错误。此时不要用 sessionId、PID、用户手填 ID 或默认目录绕过。未完成真实 App 的这一检查前，不替换日常版。
+
+2026-10-24 的本机联调已完成身份检查：在现有 App 对话中直接调用只读探针两次，不向工具传入任何参数或模拟 metadata，两次均收到同一个 `_meta.threadId`。这证明本机当前 App 的实际调用能够传入身份；完整 Session 服务在 App 中的工程绑定、双聊天隔离和重启恢复仍需分别验收。前述 Python 客户端工程测试与这项 App 身份证据分开记录。
 
 也可先用只读诊断模式单独联调，不启用任何远端工具：
 
