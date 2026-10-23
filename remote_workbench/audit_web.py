@@ -279,7 +279,8 @@ main{display:grid;grid-template-columns:minmax(250px,310px) minmax(0,1fr);height
     }
   }
   function outputSourceStream(stream) {
-    return stream === 'diff' && selectedRecord && selectedRecord.arguments && selectedRecord.arguments.mode === 'patch' ? 'stdout' : stream;
+    const gitDiff = selectedRecord && (['git_diff','ssh_git_diff'].includes(selectedRecord.tool) || selectedRecord.arguments && selectedRecord.arguments.mode === 'patch');
+    return stream === 'diff' && gitDiff ? 'stdout' : stream;
   }
   function emptyOutputText(stream) {
     return stream === 'diff' ? '无改动' : '（当前没有这类输出）';
