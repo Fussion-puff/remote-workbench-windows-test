@@ -96,7 +96,7 @@ def create_server(router: SessionRouter, *, viewer_url: str | None = None) -> Fa
                     client_session_id=identity.session_id, allowed_hosts=sorted(router.config.hosts),
                     shell_state_reused=False)
 
-    async def history(state, identity, limit=20):
+    async def history(state, identity, limit: int = 20):
         return {"targets": router.registry.history(state.workspace_id, limit)}
 
     async def workspace_snapshot(state, identity):

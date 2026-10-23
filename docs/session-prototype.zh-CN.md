@@ -1,6 +1,6 @@
 # 按 Codex 对话路由的 Session 原型
 
-`remote-workbench-session` 从 `0.3.0a1` 起作为 develop 的可选入口，当前版本为 `0.3.0a2`。它复用原有 SSH、文件、Git 和后台任务工具，保留 `remote-workbench-workspace` 与 `remote-workbench-ssh`。安装到独立 wheel 环境的日常版不会随开发源码改变。
+`remote-workbench-session` 从 `0.3.0a1` 起作为 develop 的可选入口，当前版本为 `0.3.0a3`。它复用原有 SSH、文件、Git 和后台任务工具，保留 `remote-workbench-workspace` 与 `remote-workbench-ssh`。安装到独立 wheel 环境的日常版不会随开发源码改变。
 
 ## 身份和首次绑定
 
@@ -105,7 +105,11 @@ args = ["--config", "/absolute/path/to/develop/hosts.yaml", "--data-dir", "/abso
 
 App 联调时，将 develop 原型作为独立 MCP 启用，保留日常版配置，显式使用原型的工具。在两个聊天中分别调用 `workspace_info()`：应看到不同 workspace_id，同一聊天重载 MCP 后应恢复同一个 workspace_id。如果 App 没有转发 threadId，应收到明确的身份错误。此时不要用 sessionId、PID、用户手填 ID 或默认目录绕过。未完成真实 App 的这一检查前，不替换日常版。
 
-2026-10-24 的本机联调已完成身份检查：在现有 App 对话中直接调用只读探针两次，不向工具传入任何参数或模拟 metadata，两次均收到同一个 `_meta.threadId`。这证明本机当前 App 的实际调用能够传入身份；完整 Session 服务在 App 中的工程绑定、双聊天隔离和重启恢复仍需分别验收。前述 Python 客户端工程测试与这项 App 身份证据分开记录。
+2026-10-24 的本机联调先在现有 App 对话中直接调用只读探针两次，不向工具传入任何参数或模拟 metadata，两次均收到同一个 `_meta.threadId`。随后通过 App 的完整 Session 工具绑定测试工程私有副本、增加空列名回归测试、观察失败、修改代码并通过全部 28 项工程测试。切换到另一模板再切回后，副本路径和修改保持不变，后台任务仍返回提交时工程的结果；原模板的文件指纹前后一致。这些真实 App 调用的证据与前述 Python 客户端测试分开保存。
+
+记录页也已在 App 内浏览器核对：实际命令、完整测试结果和本次补丁 diff 均可查看，空 diff 显示“无改动”。一次失败日志在本机保存 4086 字节，初始 MCP 预览返回 1687 字节，随后成功按 128 字节分页读取。这个例子验证了完整保留与限量返回的链路，不代表实际 tokenizer 成本或总体节省比例。
+
+这轮实测发现 `0.3.0a2` 的 `workspace_history.limit` 被错误声明为字符串。`0.3.0a3` 已将其修复为整数，并通过 schema、显式条数限制和非法负值的回归检查；本机完整回归为 261 项通过。已经运行的 App MCP 进程需在下次重载后才会加载新 schema。不同真实 App 聊天之间的隔离、以及同一 App 聊天在 MCP 重启后的恢复，仍待单独实测，未据此升级日常版。
 
 也可先用只读诊断模式单独联调，不启用任何远端工具：
 

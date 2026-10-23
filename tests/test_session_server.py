@@ -55,6 +55,19 @@ async def test_schema_context_injection_and_missing_identity_fail_closed(tmp_pat
     assert not router._executors
 
 
+async def test_history_limit_schema_and_validation(tmp_path):
+    router = router_at(tmp_path)
+    server = create_server(router)
+    tool = next(tool for tool in await server.list_tools() if tool.name == "workspace_history")
+    limit = tool.inputSchema["properties"]["limit"]
+    assert limit["type"] == "integer"
+    assert limit["default"] == 20
+    assert (await call(server, "a", "workspace_history", limit=0))["targets"] == []
+    with pytest.raises(ToolError, match="non-negative integer"):
+        await call(server, "a", "workspace_history", limit=-1)
+    assert not router._executors
+
+
 @pytest.fixture
 async def project(local, monkeypatch):
     _, root = local
@@ -95,6 +108,8 @@ async def test_threads_private_copies_switch_restart_and_guarded_edits(project):
     assert restored["cwd"] == a["cwd"] and restored["revision"] == 3
     assert Path(restored["cwd"], "value.txt").read_text() == "edited\n"
     assert len((await call(restarted, "a", "workspace_history"))["targets"]) == 3
+    limited = (await call(restarted, "a", "workspace_history", limit=2))["targets"]
+    assert [target["revision"] for target in limited] == [3, 2]
     assert workspace_executor.get() is None
     own = await call(server, "a", "audit_get", operation_id=changed["operation_id"])
     assert own["thread_id"] == "a" and own["revision"] == 1
