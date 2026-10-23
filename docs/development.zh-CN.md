@@ -75,7 +75,7 @@ args = ["--workspace", "/absolute/path/to/opt/remote-workbench/develop/workspace
 env = { REMOTE_WORKBENCH_AUDIT_DIR = "/absolute/path/to/opt/remote-workbench/develop/audit" }
 ```
 
-开发版 manifest 的 `config` 和 `cwd` 应分别指向开发配置及远端测试目录。稳定版 manifest 的 `config` 和 `cwd` 则固定到稳定配置及日常项目。不要让两个 workspace 共用 audit 目录；两个 viewer 也使用不同端口。
+开发版 manifest 的 `config` 和 `cwd` 应分别指向开发配置及远端测试目录。稳定版 manifest 的 `config` 和 `cwd` 则固定到稳定配置及日常项目。不要让开发与稳定 workspace 共用 audit 目录；两个 viewer 使用不同的首选端口。同一个 MCP 被多个聊天同时启动时，端口冲突的实例会自动选择空闲端口，实际查看地址由 `workspace_info.viewer_url` 返回。
 
 发布时，先在新 release 环境核对版本和导入路径，再用新版本运行 `workspace_info`，确认远端主机、目录和默认 shell；随后确认命令、输出和 diff 出现在稳定版审计记录与本机 viewer 中。通过后，把 Codex 稳定 MCP 项的 `command` 明确改为新 release 的启动器路径，重新加载 MCP 配置，再做一次连接检查。该切换不会自动从 Git 拉取或更新代码。
 

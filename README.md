@@ -53,7 +53,7 @@ Update the paths in [codex-mcp.example.toml](codex-mcp.example.toml) for your cl
 
 ## Commands, output, and code changes
 
-The local audit viewer presents the actual remote command, its output, and file diffs in a readable page. With `--viewer-port`, it is available at `http://127.0.0.1:8768`; it reads the local audit files directly and does not send them back through MCP. The viewer is a separate page: it does not turn ordinary MCP calls into Codex's native terminal or file-change cards. If an agent explicitly reads saved output through MCP, that content still uses model context.
+The local audit viewer presents the actual remote command, its output, and file diffs in a readable page. With `--viewer-port 8768`, it prefers `http://127.0.0.1:8768`. If another process already uses that port, it selects an available local port so concurrent MCP instances can start. `workspace_info.viewer_url` and startup stderr report the actual URL. Each process serves its own configured audit directory; it does not reuse the service occupying the preferred port. The page reads local audit files directly without sending them back through MCP. The viewer is a separate page: it does not turn ordinary MCP calls into Codex's native terminal or file-change cards. If an agent explicitly reads saved output through MCP, that content still uses model context.
 
 The bound workspace returns compact previews by default: 2 KiB for command output and 4 KiB for file, patch, and Git diff output. Full output and diffs remain in local audit records and can be read in pages when needed. MCP responses use one compact JSON text result rather than duplicating it in text and structured content.
 

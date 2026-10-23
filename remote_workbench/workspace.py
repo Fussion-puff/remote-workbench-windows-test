@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import errno
 from dataclasses import dataclass, replace
 from contextlib import contextmanager
 import functools
@@ -149,7 +150,7 @@ def _workspace_response(tool, default_max_bytes: int | None = None):
     return invoke
 
 
-def create_server(workspace: Workspace) -> FastMCP:
+def create_server(workspace: Workspace, *, viewer_url: str | None = None) -> FastMCP:
     server = FastMCP("remote-workbench-workspace-" + workspace.name, instructions=(
         f"Default project environment: {workspace.host}:{workspace.cwd}. "
         "Use these tools for all project commands, files, search, edits, Git and tests. "
@@ -159,6 +160,7 @@ def create_server(workspace: Workspace) -> FastMCP:
         "Control and audit records stay local; only shell/Python workers run remotely. "
         "On SSH failure stop and report; never fall back to local project execution. "
         "This is a default directory, not a filesystem sandbox."
+        + (f" Local audit viewer: {viewer_url}." if viewer_url else "")
     ))
 
     async def workspace_info() -> dict[str, Any]:
@@ -167,6 +169,8 @@ def create_server(workspace: Workspace) -> FastMCP:
         result = {"name": workspace.name, "host": workspace.host, "cwd": workspace.cwd,
                   "control": "local", "execution": "remote", "connected": connected,
                   "shell_state_reused": False, "connection_message": message}
+        if viewer_url is not None:
+            result["viewer_url"] = viewer_url
         if connected:
             probe_code = ('import json,os; print(json.dumps({"cwd":os.getcwd(), '
                           '"shell":os.environ.get("REMOTE_WORKBENCH_LOGIN_SHELL", "")}))')
@@ -206,11 +210,20 @@ def _local_audit_viewer(port: int | None):
     if isinstance(port, bool) or not 1 <= port <= 65535:
         raise ValueError("viewer port must be between 1 and 65535")
 
-    viewer = ThreadingHTTPServer(("127.0.0.1", port), AuditViewerHandler)
+    try:
+        viewer = ThreadingHTTPServer(("127.0.0.1", port), AuditViewerHandler)
+    except OSError as exc:
+        if exc.errno != errno.EADDRINUSE:
+            raise
+        # MCP clients can start one process per chat or discovery request.
+        # Keep each process's viewer independent of whoever owns this port.
+        viewer = ThreadingHTTPServer(("127.0.0.1", 0), AuditViewerHandler)
+        print(f"Audit viewer port {port} is in use; using {viewer.server_port}.",
+              file=sys.stderr, flush=True)
     thread = Thread(
         target=viewer.serve_forever,
         kwargs={"poll_interval": 0.1},
-        name=f"remote-workbench-audit-viewer-{port}",
+        name=f"remote-workbench-audit-viewer-{viewer.server_port}",
         daemon=True,
     )
     started = False
@@ -231,13 +244,16 @@ def _local_audit_viewer(port: int | None):
 def main():
     parser = argparse.ArgumentParser(description="Local Remote Workbench MCP bound to one remote workspace")
     parser.add_argument("--workspace", required=True, help="Local workspace JSON manifest")
-    parser.add_argument("--viewer-port", type=int, help="Also serve the local audit viewer on 127.0.0.1:<port>")
+    parser.add_argument("--viewer-port", type=int,
+                        help="Preferred local audit viewer port; if occupied, use an available port")
     args = parser.parse_args()
     workspace = Workspace.load(args.workspace)
     with _local_audit_viewer(args.viewer_port) as viewer:
+        viewer_url = None
         if viewer is not None:
-            print(f"Local audit viewer: http://127.0.0.1:{viewer.server_port}", file=sys.stderr, flush=True)
-        create_server(workspace).run()
+            viewer_url = f"http://127.0.0.1:{viewer.server_port}"
+            print(f"Local audit viewer: {viewer_url}", file=sys.stderr, flush=True)
+        create_server(workspace, viewer_url=viewer_url).run()
 
 
 if __name__ == "__main__":

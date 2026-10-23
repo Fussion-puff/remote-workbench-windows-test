@@ -1,5 +1,8 @@
+import errno
 import json
-from unittest.mock import MagicMock, patch
+import socket
+from unittest.mock import AsyncMock, MagicMock, patch
+from urllib.request import urlopen
 
 from mcp.types import CallToolResult, TextContent
 import pytest
@@ -116,6 +119,115 @@ def test_local_audit_viewer_is_optional_loopback_and_closes_on_exit():
                 raise RuntimeError("leave MCP")
 
     assert events == ["shutdown", "close", "join"]
+
+
+def test_local_audit_viewer_falls_back_only_when_requested_port_is_occupied():
+    viewer = MagicMock()
+    viewer.server_port = 43210
+    bind_error = OSError(errno.EADDRINUSE, "Address already in use")
+    server_factory = MagicMock(side_effect=[bind_error, viewer])
+    thread = MagicMock()
+
+    with patch.object(workspace_module, "ThreadingHTTPServer", server_factory), \
+         patch.object(workspace_module, "Thread", return_value=thread) as thread_factory:
+        with workspace_module._local_audit_viewer(8768) as active:
+            assert active is viewer
+
+    assert [call.args for call in server_factory.call_args_list] == [
+        (("127.0.0.1", 8768), workspace_module.AuditViewerHandler),
+        (("127.0.0.1", 0), workspace_module.AuditViewerHandler),
+    ]
+    thread_factory.assert_called_once_with(
+        target=viewer.serve_forever,
+        kwargs={"poll_interval": 0.1},
+        name="remote-workbench-audit-viewer-43210",
+        daemon=True,
+    )
+    thread.start.assert_called_once_with()
+    viewer.shutdown.assert_called_once_with()
+    viewer.server_close.assert_called_once_with()
+    thread.join.assert_called_once_with()
+
+
+@pytest.mark.parametrize("error_number", [errno.EACCES, errno.EADDRNOTAVAIL])
+def test_local_audit_viewer_preserves_unrelated_bind_errors(error_number):
+    bind_error = OSError(error_number, "bind failed")
+    server_factory = MagicMock(side_effect=bind_error)
+    thread_factory = MagicMock()
+
+    with patch.object(workspace_module, "ThreadingHTTPServer", server_factory), \
+         patch.object(workspace_module, "Thread", thread_factory):
+        with pytest.raises(OSError) as caught:
+            with workspace_module._local_audit_viewer(8768):
+                pytest.fail("viewer must not start when bind fails")
+
+    assert caught.value is bind_error
+    server_factory.assert_called_once_with(("127.0.0.1", 8768), workspace_module.AuditViewerHandler)
+    thread_factory.assert_not_called()
+
+
+def test_local_audit_viewer_preserves_fallback_bind_error():
+    occupied_error = OSError(errno.EADDRINUSE, "Address already in use")
+    fallback_error = OSError(errno.EMFILE, "Too many open files")
+    server_factory = MagicMock(side_effect=[occupied_error, fallback_error])
+    thread_factory = MagicMock()
+
+    with patch.object(workspace_module, "ThreadingHTTPServer", server_factory), \
+         patch.object(workspace_module, "Thread", thread_factory):
+        with pytest.raises(OSError) as caught:
+            with workspace_module._local_audit_viewer(8768):
+                pytest.fail("viewer must not start when the fallback bind fails")
+
+    assert caught.value is fallback_error
+    assert [call.args for call in server_factory.call_args_list] == [
+        (("127.0.0.1", 8768), workspace_module.AuditViewerHandler),
+        (("127.0.0.1", 0), workspace_module.AuditViewerHandler),
+    ]
+    thread_factory.assert_not_called()
+
+
+def test_local_audit_viewer_uses_separate_live_listener_when_port_is_occupied():
+    # Release an OS-selected loopback port, then let the first managed viewer
+    # claim it. If another process wins that tiny race, its own fallback port
+    # becomes the port deliberately occupied by the second managed viewer.
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as reservation:
+        reservation.bind(("127.0.0.1", 0))
+        requested_port = reservation.getsockname()[1]
+
+    def assert_serving(port):
+        with urlopen(f"http://127.0.0.1:{port}/", timeout=2) as response:
+            assert response.status == 200
+            assert b"Remote Workbench" in response.read(4096)
+
+    with workspace_module._local_audit_viewer(requested_port) as first:
+        occupied_port = first.server_port
+        assert_serving(occupied_port)
+
+        with workspace_module._local_audit_viewer(occupied_port) as second:
+            assert second.server_port != occupied_port
+            assert_serving(occupied_port)
+            assert_serving(second.server_port)
+
+        assert second.fileno() == -1
+        assert first.fileno() >= 0
+        assert_serving(occupied_port)
+
+    assert first.fileno() == -1
+
+
+async def test_workspace_info_includes_only_the_viewer_url_for_its_mcp(local):
+    executor, root = local
+    executor.check_connection = AsyncMock(return_value=(False, "Disconnected"))
+    workspace = Workspace("viewer-link", "remote", str(root), executor)
+    viewer_url = "http://127.0.0.1:43210"
+
+    with_viewer = create_server(workspace, viewer_url=viewer_url)
+    response = decode_content(await with_viewer.call_tool("workspace_info", {}))
+    assert response["viewer_url"] == viewer_url
+
+    without_viewer = create_server(workspace)
+    response = decode_content(await without_viewer.call_tool("workspace_info", {}))
+    assert "viewer_url" not in response
 
 
 @pytest.mark.parametrize("port", [0, -1, 65536, True])
