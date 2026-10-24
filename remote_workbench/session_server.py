@@ -25,6 +25,7 @@ from remote_workbench.workspace_router import SessionRouter, default_state_dir
 from remote_workbench.workspace_registry import WorkspaceTarget
 from remote_workbench.presentation import is_test_command
 from remote_workbench.workspace_snapshot import collect as collect_snapshot
+from remote_workbench.compute_review import REVIEW_INSTRUCTIONS
 
 _LOCAL_TOOLS = {"audit_list", "audit_get", "read_output"}
 _BUDGETS = {"exec_command": 2048, "read_file": 4096, "patch_file": 4096, "git_diff": 4096}
@@ -72,6 +73,7 @@ def create_server(router: SessionRouter, *, viewer_url: str | None = None) -> Fa
         "This is workspace separation, not an operating-system sandbox. "
         "Whenever tools return operation_log, include that Markdown link with the exact bold title "
         "'Remote Workbench 操作记录' in user-facing updates and the final reply."
+        + REVIEW_INSTRUCTIONS
     ))
 
     def workspace_url(state):
@@ -219,7 +221,7 @@ def create_server(router: SessionRouter, *, viewer_url: str | None = None) -> Fa
         async def execute(state, identity, _name=name, _function=function, **arguments):
             if _name in _LOCAL_TOOLS:
                 return await _function(**arguments)
-            target = router.registry.get_job(state.workspace_id, arguments["job_id"]) if _name == "job_status" else None
+            target = router.registry.get_job(state.workspace_id, arguments["job_id"]) if _name in {"job_status", "stop_job"} else None
             snapshot = router.snapshot(state, target)
             if _name == "start_job":
                 job_id = arguments.get("job_id") or uuid.uuid4().hex
@@ -234,7 +236,7 @@ def create_server(router: SessionRouter, *, viewer_url: str | None = None) -> Fa
             tool = bind_tool(snapshot.workspace, _name, _function, "")
             with audit.scoped_metadata(**snapshot.metadata(), client_session_id=identity.session_id):
                 result = await tool(**arguments)
-            if _name == "exec_command" and is_test_command(arguments["command"]):
+            if _name == "exec_command" and is_test_command(arguments["command"]) and result.get("executed") is not False:
                 state_known = result.get("execution_state") == "finished" and not result.get("timed_out")
                 observation = {"operation_id": result.get("operation_id"), "exit_code": result.get("exit_code"),
                     "status": ("passed" if result.get("exit_code") == 0 else "failed") if state_known else "unknown",

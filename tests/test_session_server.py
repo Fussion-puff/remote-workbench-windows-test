@@ -13,7 +13,7 @@ from mcp.shared.context import RequestContext
 
 from remote_workbench import audit
 from remote_workbench.config import HostConfig, ServerConfig
-from remote_workbench.server import require_connection, workspace_executor
+from remote_workbench.server import require_connection, get_executor, workspace_executor
 from remote_workbench.session_server import create_server
 from remote_workbench.ssh import SSHExecutor
 from remote_workbench.tools import commands, files, git, search, patch
@@ -32,14 +32,14 @@ async def call(server, thread, name, **arguments):
 
 
 def router_at(path):
-    return SessionRouter(ServerConfig(hosts={"a": HostConfig("host-a"), "b": HostConfig("host-b")}), path)
+    return SessionRouter(ServerConfig(hosts={"a": HostConfig("host-a", execution_enabled=True), "b": HostConfig("host-b", execution_enabled=True)}), path)
 
 
 async def test_schema_context_injection_and_missing_identity_fail_closed(tmp_path):
     router = router_at(tmp_path)
     server = create_server(router)
     tools = await server.list_tools()
-    assert len(tools) == 19
+    assert len(tools) == 20
     for tool in tools:
         fields = tool.inputSchema["properties"]
         assert not {"ctx", "thread_id", "threadId", "workspace_id", "session_id"} & fields.keys()
@@ -73,6 +73,7 @@ async def project(local, monkeypatch):
     _, root = local
     for module in (commands, files, git, search, patch):
         monkeypatch.setattr(module, "require_connection", require_connection)
+    monkeypatch.setattr(commands, "get_executor", get_executor)
     monkeypatch.setattr(SSHExecutor, "check_connection", AsyncMock(return_value=(True, "connected")))
     source = root / "source"
     source.mkdir()
@@ -155,8 +156,13 @@ async def test_job_uses_origin_after_switch_and_cannot_cross_thread(project):
     assert status["exit_code"] == 0 and status["stdout_tail"] == "origin-job"
     origin = router.registry.get_job(original["workspace_id"], "same")
     assert origin.host == "a" and origin.cwd == original["cwd"]
+    stopped = await call(server, "a", "stop_job", job_id="same")
+    assert stopped["cancel_requested"] is False and stopped["execution_state"] == "finished"
+    assert stopped["task_dir"].startswith(original["cwd"] + "/")
     with pytest.raises(ToolError, match="Unknown job"):
         await call(server, "b", "job_status", job_id="same")
+    with pytest.raises(ToolError, match="Unknown job"):
+        await call(server, "b", "stop_job", job_id="same")
 
 
 async def test_switch_waits_for_foreground_call_across_router_instances(project):

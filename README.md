@@ -8,7 +8,7 @@ This is an independently maintained derivative of [Onirika](https://github.com/x
 
 本机开发环境与日常稳定版的隔离、安装和切换方式见[开发与稳定版部署](docs/development.zh-CN.md)。
 
-Develop also includes an opt-in `remote-workbench-session` prototype (0.3.0a4): persistent workspaces routed by MCP `_meta.threadId`, atomic host/directory switching, jobs pinned to their original targets and checked against node/process identity, explicit project snapshots, and measured response bytes. Each thread keeps its own remote project copies. An identity-only diagnostic is available before enabling remote tools. This does not change an independently installed stable release; see [Session 原型与客户端联调边界](docs/session-prototype.zh-CN.md).
+Develop also includes an opt-in `remote-workbench-session` prototype (0.3.0a5): persistent workspaces routed by MCP `_meta.threadId`, atomic host/directory switching, jobs pinned to their original targets and checked against node/process identity, explicit project snapshots, and measured response bytes. Each thread keeps its own remote project copies. An identity-only diagnostic is available before enabling remote tools. This does not change an independently installed stable release; see [Session 原型与客户端联调边界](docs/session-prototype.zh-CN.md).
 
 ## Use a remote project as the default environment
 
@@ -66,6 +66,8 @@ The local audit viewer presents the actual remote command, its output, and file 
 The bound workspace returns compact previews by default: 2 KiB for command output and 4 KiB for file, patch, and Git diff output. Full output and diffs remain in local audit records and can be read in pages when needed. MCP responses use one compact JSON text result rather than duplicating it in text and structured content.
 
 File edits can use hash-guarded replacements or unified Git patches. Review the returned change with `git_diff` or `git_status`, then run the relevant checks on the remote host. Remote jobs run only when explicitly started.
+
+Develop adds supervised process-group cleanup for cancellation, disconnects and deadlines, plus `stop_job` and a control-only `remote-workbench-cleanup` entry point. Substantial computation requires the agent to present the command, concurrency and environment and obtain explicit user confirmation; common parallel launchers have a review check. This workflow requires no cgroup or universal process cap. It is not an OS sandbox or a guarantee against runaway processes. See [计算审核与任务生命周期](docs/process-safety.zh-CN.md).
 
 Local audit files can contain commands, arguments, file contents, and output. Keep them private. Set `REMOTE_WORKBENCH_AUDIT_DIR` to choose their local directory; the default directory name is `.remote-workbench-audit`. In a bound workspace, remote lock and job state is stored beneath the workspace root in `.remote-workbench-state`; `REMOTE_WORKBENCH_REMOTE_STATE_DIR` controls the remote state directory for other modes.
 

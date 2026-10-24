@@ -30,6 +30,19 @@ hosts:
     # Timeout for regular commands in seconds (default: 30).
     command_timeout: 30
 
+    # Detached jobs also have a remote deadline (seconds); each job can override it.
+    job_timeout: 3600
+
+    # Grace period between TERM and KILL of the task's own process group.
+    terminate_grace_seconds: 2
+
+    # Common parallel commands at/above this concurrency ask for user review.
+    # This is a review threshold, not a process/thread cap. No cgroup required.
+    compute_review_threshold: 8
+
+    # Optional manual pause. Cleanup remains available when paused.
+    execution_enabled: true
+
     # Timeout for file operations in seconds (default: 60).
     file_timeout: 60
 

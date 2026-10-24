@@ -1,0 +1,335 @@
+"""Standalone remote task supervisor. No preload hooks or patched spawn APIs.
+
+This source is also sent to remote Python; keep it stdlib-only and Python 3.10+.
+The controller and supervisor stay outside the workload process group.
+"""
+import json
+import os
+from pathlib import Path
+import re
+import select
+import signal
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+
+if "login_spec" not in globals():
+    from remote_workbench.remote_shell import login_spec
+
+
+def machine_identity():
+    value = {"node": os.uname().nodename, "boot_id": None}
+    try:
+        value["boot_id"] = Path("/proc/sys/kernel/random/boot_id").read_text().strip() or None
+    except OSError:
+        pass
+    return value
+
+
+def process_start(pid):
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return None
+    if Path("/proc").is_dir():
+        try:
+            data = Path(f"/proc/{pid}/stat").read_text()
+            fields = data[data.rindex(")") + 2:].split()
+            return "proc:" + fields[19] if fields[0] != "Z" else None
+        except (OSError, ValueError, IndexError):
+            return None
+    try:
+        result = subprocess.run(["ps", "-p", str(pid), "-o", "lstart="],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=2)
+        return "ps:" + result.stdout.decode().strip() if result.returncode == 0 and result.stdout.strip() else None
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def job_liveness(origin):
+    current = machine_identity()
+    detail = {"origin_node": origin.get("node"), "observed_node": current["node"]}
+    if not isinstance(origin.get("node"), str) or not isinstance(origin.get("start_token"), str) or not origin["start_token"]:
+        return None, dict(detail, state_reason="identity_unavailable")
+    if origin["node"] != current["node"]:
+        return None, dict(detail, state_reason="different_node")
+    if origin.get("boot_id") and origin["boot_id"] != current["boot_id"]:
+        return None, dict(detail, state_reason="different_boot")
+    if origin["start_token"].startswith("proc:") and not origin.get("boot_id"):
+        return None, dict(detail, state_reason="boot_identity_unavailable")
+    if process_start(origin.get("pid")) != origin["start_token"]:
+        return None, dict(detail, state_reason="process_unconfirmed")
+    return True, {}
+
+
+def task_state_root():
+    default = Path.home() / ".cache" / "remote-workbench-ssh"
+    return Path(os.environ.get("REMOTE_WORKBENCH_REMOTE_STATE_DIR", str(default))).expanduser().absolute()
+
+
+def save_task_json(path, value):
+    temporary = path.with_suffix(".tmp")
+    with open(temporary, "w", opener=lambda p, f: os.open(p, f, 0o600)) as output:
+        json.dump(value, output)
+    os.replace(temporary, path)
+
+
+def child_exited(process, completion=None):
+    # Keep the leader unreaped until cleanup has finished. Its PID/PGID cannot
+    # be reused while a zombie is still our child. Never poll()/wait() early.
+    if completion is not None:
+        return completion.exists()
+    return os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None
+
+
+def signal_workload_group(process, number, completion=None):
+    try:
+        os.killpg(process.pid, number)
+    except ProcessLookupError:
+        pass
+    except PermissionError:
+        # macOS returns EPERM for a group containing only our retained zombie.
+        # Ignore it only after positively excluding any live group member.
+        if not child_exited(process, completion):
+            raise
+        result = subprocess.run(["ps", "-axo", "pid=,pgid=,stat="], capture_output=True, timeout=2, check=True)
+        for line in result.stdout.decode().splitlines():
+            fields = line.split()
+            if len(fields) == 3 and fields[1] == str(process.pid) and not fields[2].startswith("Z"):
+                raise PermissionError("Could not signal a live workload group member")
+
+
+def cleanup_workload(process, grace, completion=None):
+    """TERM, then KILL of this owned group; this is not a process-count cap."""
+    signal_workload_group(process, signal.SIGTERM, completion)
+    end = time.monotonic() + grace
+    while time.monotonic() < end:
+        if child_exited(process, completion):
+            break
+        time.sleep(0.05)
+    signal_workload_group(process, signal.SIGKILL, completion)
+    code = process.wait(timeout=2)
+    if completion is not None and completion.exists():
+        code = int(completion.read_text())
+    return code, {"cleanup_state": "process_group_signalled", "tree_confirmed": False,
+                  "cleanup_scope": "process_group", "hard_process_limit": False}
+
+
+def read_task_input(length, deadline):
+    data = bytearray()
+    while len(data) < length:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or not select.select([0], [], [], remaining)[0]:
+            raise ValueError("Timed out receiving task input")
+        chunk = os.read(0, min(65536, length - len(data)))
+        if not chunk:
+            raise ValueError("Controller disconnected before task input completed")
+        data.extend(chunk)
+    return bytes(data)
+
+
+def forward_task_output(reader, name, root, marker):
+    """Detached logs retain the same startup/output separation as foreground."""
+    pending = b""
+    started = False
+    output = getattr(sys, name).buffer
+    with open(root / ("startup_" + name + ".log"), "wb",
+              opener=lambda p, f: os.open(p, f, 0o600)) as startup:
+        for chunk in iter(lambda: reader.read1(65536), b""):
+            if started:
+                output.write(chunk)
+                output.flush()
+                continue
+            pending += chunk
+            offset = pending.find(marker)
+            if offset >= 0:
+                startup.write(pending[:offset])
+                output.write(pending[offset + len(marker):])
+                output.flush()
+                pending = b""
+                started = True
+            elif len(pending) > 65536:
+                startup.write(pending[:-1024])
+                pending = pending[-1024:]
+        if not started:
+            startup.flush()
+            output.write((root / ("startup_" + name + ".log")).read_bytes() + pending)
+            output.flush()
+
+
+def supervise_task(settings):
+    """Run one workload, with an independent deadline and foreground lease."""
+    policy = settings["policy"]
+    timeout = settings["timeout"]
+    if timeout <= 0:
+        raise ValueError("Task deadline must be positive")
+    retains_zombie = all(hasattr(os, name) for name in ("waitid", "WNOWAIT", "WEXITED"))
+    task_id = settings["task_id"]
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", task_id):
+        raise ValueError("Invalid task ID")
+    root = Path(settings["task_dir"])
+    root.mkdir(parents=True, mode=0o700, exist_ok=settings.get("directory_exists", False))
+    foreground = not settings.get("detached", False)
+    marker = ("\x1eREMOTE_WORKBENCH_TASK_" + task_id + ":").encode()
+
+    def publish(value):
+        save_task_json(root / "status.json", value)
+        if foreground:
+            try:
+                os.write(2, marker + json.dumps(value).encode() + b"\x1f\n")
+            except OSError:
+                pass
+
+    origin = dict(machine_identity(), version=2, pid=os.getpid(), start_token=process_start(os.getpid()),
+                  task_id=task_id, task_dir=str(root), backend="process-group",
+                  timeout_seconds=timeout)
+    save_task_json(root / "origin.json", origin)
+    process = None
+    completion = None if retains_zombie else root / "workload_exit_code"
+    reason = "finished"
+    code = 126
+    details = {"cleanup_state": "not_started", "tree_confirmed": True}
+    received_signal = []
+    threads = []
+    old_handlers = {}
+    for number in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        old_handlers[number] = signal.signal(number, lambda n, f: received_signal.append(n))
+    deadline = time.monotonic() + timeout
+    try:
+        if not policy["execution_enabled"]:
+            raise ValueError("Remote execution is disabled")
+        data = read_task_input(settings.get("stdin_bytes", 0), deadline) if foreground else b""
+        with tempfile.TemporaryFile() as input_file:
+            input_file.write(data)
+            input_file.seek(0)
+            spec = login_spec(settings["command"], settings["cwd"], preamble=settings.get("preamble", ""),
+                              markers=settings.get("markers"), trace=settings.get("trace", False),
+                              environment=settings.get("environment"))
+            # Real exec preserves the account shell; no preload/spawn hooks.
+            launcher = "import os\n"
+            if completion is not None:
+                launcher += "import signal\nsignal.signal(signal.SIGTERM, signal.SIG_DFL)\nsignal.signal(signal.SIGHUP, signal.SIG_DFL)\nsignal.signal(signal.SIGINT, signal.SIG_DFL)\n"
+            launcher += "os.execvpe(" + repr(spec["shell"]) + ", " + repr(spec["argv"]) + ", dict(os.environ, **" + repr(spec["env_updates"]) + "))\n"
+            if completion is not None:
+                # Older macOS Python lacks waitid/WNOWAIT. A tiny group leader
+                # remains alive after the real command exits, reserving PGID
+                # until our final KILL. It does not intercept spawn APIs.
+                guardian = "import os,signal,subprocess,sys,time\n"
+                guardian += "for n in (signal.SIGTERM,signal.SIGHUP,signal.SIGINT): signal.signal(n,signal.SIG_IGN)\n"
+                guardian += "try:\n p=subprocess.Popen([sys.executable,'-c'," + repr(launcher) + "])\n"
+                guardian += " with open(" + repr(str(root / "workload_pid.tmp")) + ",'w') as f: f.write(str(p.pid))\n"
+                guardian += " os.replace(" + repr(str(root / "workload_pid.tmp")) + "," + repr(str(root / "workload_pid")) + ")\n code=p.wait()\n"
+                guardian += "except OSError as exc:\n print(str(exc),file=sys.stderr,flush=True)\n code=127\n"
+                guardian += "with open(" + repr(str(completion) + ".tmp") + ",'w') as f: f.write(str(code))\n"
+                guardian += "os.replace(" + repr(str(completion) + ".tmp") + "," + repr(str(completion)) + ")\n"
+                guardian += "while True: time.sleep(3600)\n"
+                launcher = guardian
+            streams = {name: subprocess.PIPE for name in ("stdout", "stderr")} if not foreground else {}
+            process = subprocess.Popen([sys.executable, "-c", launcher], stdin=input_file,
+                                       start_new_session=True, **streams)
+        if not foreground:
+            for name in ("stdout", "stderr"):
+                thread = threading.Thread(target=forward_task_output,
+                    args=(getattr(process, name), name, root, settings["markers"][name].encode()), daemon=True)
+                thread.start()
+                threads.append(thread)
+        origin.update(workload_pid=process.pid if retains_zombie else None, pgid=process.pid)
+        save_task_json(root / "origin.json", origin)
+        publish(dict(origin, state="running"))
+        last_heartbeat = time.monotonic()
+        while True:
+            if completion is not None and origin["workload_pid"] is None and (root / "workload_pid").exists():
+                origin["workload_pid"] = int((root / "workload_pid").read_text())
+                save_task_json(root / "origin.json", origin)
+                publish(dict(origin, state="running"))
+            if received_signal:
+                reason = "supervisor_signal"
+                break
+            if (root / "cancel").exists():
+                reason = "cancelled"
+                break
+            if time.monotonic() >= deadline:
+                reason = "timeout"
+                break
+            if foreground:
+                if select.select([0], [], [], 0)[0]:
+                    message = os.read(0, 4096)
+                    if not message:
+                        reason = "controller_disconnected"
+                        break
+                    if b"C" in message:
+                        reason = "cancelled"
+                        break
+                    last_heartbeat = time.monotonic()
+                if time.monotonic() - last_heartbeat > 5:
+                    reason = "controller_lease_expired"
+                    break
+            if child_exited(process, completion):
+                break
+            time.sleep(0.05)
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        reason = "launch_failed"
+        print(str(exc), file=sys.stderr, flush=True)
+        details["message"] = str(exc)
+    finally:
+        if process is not None:
+            try:
+                code, cleaned = cleanup_workload(process, policy["terminate_grace_seconds"], completion)
+                details.update(cleaned)
+            except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                details.update(cleanup_state="unconfirmed", tree_confirmed=False, message=str(exc))
+                # Do not reap a still-running workload and call it cancelled.
+        for thread in threads:
+            thread.join(timeout=2)
+        if any(thread.is_alive() for thread in threads):
+            details.update(cleanup_state="unconfirmed", tree_confirmed=False,
+                           message="A descendant still holds an output pipe open")
+        for number, handler in old_handlers.items():
+            signal.signal(number, handler)
+        if reason == "timeout":
+            code = 124
+        elif reason in {"cancelled", "controller_disconnected", "controller_lease_expired", "supervisor_signal"}:
+            code = 130
+        elif reason == "launch_failed":
+            code = 126
+        code = code if code >= 0 else 128 - code
+        final = dict(origin, state="finished", reason=reason, exit_code=code, **details)
+        publish(final)
+        with open(root / "exit_code.tmp", "w", opener=lambda p, f: os.open(p, f, 0o600)) as output:
+            output.write(str(code))
+        os.replace(root / "exit_code.tmp", root / "exit_code")
+    return code
+
+
+def cancel_task(root, wait_seconds=0):
+    """Independent control request. Never kill a PID taken from an old file."""
+    root = Path(root)
+    try:
+        status = json.loads((root / "status.json").read_text())
+        if status.get("state") == "finished":
+            return dict(status, cancel_requested=False,
+                        execution_state="unknown" if status.get("cleanup_state") == "unconfirmed" else "finished")
+    except FileNotFoundError:
+        pass
+    origin = json.loads((root / "origin.json").read_text())
+    running, detail = job_liveness(origin)
+    if not running or origin.get("version") != 2:
+        return {"cancel_requested": False, "execution_state": "unknown", **detail}
+    # The supervisor outside the workload scope performs TERM -> KILL itself.
+    try:
+        fd = os.open(root / "cancel", os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        os.close(fd)
+    except FileExistsError:
+        pass
+    end = time.monotonic() + wait_seconds
+    while time.monotonic() < end:
+        try:
+            status = json.loads((root / "status.json").read_text())
+            if status.get("state") == "finished":
+                return dict(status, cancel_requested=True,
+                            execution_state="unknown" if status.get("cleanup_state") == "unconfirmed" else "finished")
+        except FileNotFoundError:
+            pass
+        time.sleep(0.05)
+    return {"cancel_requested": True, "execution_state": "cancellation_requested",
+            "node": origin["node"], "pid": origin["pid"], "pgid": origin.get("pgid")}

@@ -180,7 +180,7 @@ async def test_file_git_search_and_job_tools_run_under_native_shell(
     monkeypatch.setenv("REMOTE_WORKBENCH_AUDIT_DIR", str(tmp_path / "audit"))
     workspace = tmp_path / "project"
     workspace.mkdir()
-    config = HostConfig(ssh_host="native-shell-test", default_cwd=str(workspace))
+    config = HostConfig(ssh_host="native-shell-test", execution_enabled=True, default_cwd=str(workspace))
     executor = SSHExecutor(config, remote_state_dir=str(workspace / ".remote-workbench-state"))
 
     async def require_test_executor(*_args, **_kwargs):
@@ -188,6 +188,7 @@ async def test_file_git_search_and_job_tools_run_under_native_shell(
 
     for module in (files, git, commands, patch, search):
         monkeypatch.setattr(module, "require_connection", require_test_executor)
+    monkeypatch.setattr(commands, "get_executor", lambda host=None: executor)
 
     real_create = asyncio.create_subprocess_exec
     child_env = os.environ.copy()
@@ -295,7 +296,7 @@ def test_existing_term_is_preserved_in_launch_environment(tmp_path: Path, monkey
 
 
 @pytest.mark.parametrize("shell_name", SHELLS)
-def test_ssh_command_bootstrap_survives_outer_native_shell_and_opaque_paths(
+async def test_ssh_command_bootstrap_survives_outer_native_shell_and_opaque_paths(
     shell_name: str, tmp_path: Path, monkeypatch
 ) -> None:
     found = shutil.which(shell_name)
@@ -307,34 +308,30 @@ def test_ssh_command_bootstrap_survives_outer_native_shell_and_opaque_paths(
     project = tmp_path / "project with 'quote' !;literal$cash"
     project.mkdir()
     state_dir = tmp_path / "state with 'quote' !;literal$cash"
-    record_id = "shell-matrix-wrapper"
     payload = b"outer-wrapper-stdin:\x00\xff\r\nend"
     command = (
         "printf 'cwd=%s\\nstate=%s\\n' "
         "\"$PWD\" \"$REMOTE_WORKBENCH_REMOTE_STATE_DIR\"; cat"
     )
     executor = SSHExecutor(
-        HostConfig(ssh_host="shell-test", default_cwd=str(project)),
+        HostConfig(ssh_host="shell-test", execution_enabled=True, default_cwd=str(project)),
         remote_state_dir=str(state_dir),
     )
-    wrapped = executor._wrap_command(command, str(project), record_id=record_id)
     child_env = os.environ.copy()
     child_env["PATH"] = str(Path(sys.executable).parent) + os.pathsep + child_env.get("PATH", "")
 
-    result = subprocess.run(
-        [shell, "-c", wrapped],
-        executable=shell,
-        env=child_env,
-        input=payload,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        timeout=15,
-        check=False,
-    )
+    monkeypatch.setenv("REMOTE_WORKBENCH_AUDIT_DIR", str(tmp_path / "audit"))
+    real_create = asyncio.create_subprocess_exec
+    async def transport(*args, **kwargs):
+        return await real_create(shell, "-c", args[-1], env=child_env, **kwargs)
+    monkeypatch.setattr(ssh_module.asyncio, "create_subprocess_exec", transport)
+    result = await executor.run(command, input_data=payload, timeout=15)
 
-    assert result.returncode == 0, result.stderr.decode("utf-8", "replace")
-    assert f"\x1eREMOTE_WORKBENCH_STDOUT_{record_id}\x1f\n".encode() in result.stdout
-    assert f"\x1eREMOTE_WORKBENCH_CWD_{record_id}:{project}\x1f\n".encode() in result.stderr
-    assert f"cwd={project}\n".encode() in result.stdout
-    assert f"state={state_dir}\n".encode() in result.stdout
-    assert result.stdout.endswith(payload)
+    from remote_workbench import audit
+    output = (audit.directory(result.output_id) / "stdout").read_bytes()
+    record = __import__("json").loads((audit.directory(result.output_id) / "record.json").read_text())
+    assert result.exit_code == 0, result.stderr
+    assert record["actual_cwd"] == str(project)
+    assert f"cwd={project}\n".encode() in output
+    assert f"state={state_dir}\n".encode() in output
+    assert output.endswith(payload)

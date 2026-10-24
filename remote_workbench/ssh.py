@@ -9,6 +9,7 @@ import os
 import re
 import hashlib
 import shutil
+import json
 from pathlib import Path
 from remote_workbench import audit
 from dataclasses import dataclass
@@ -30,6 +31,7 @@ class SSHResult:
     output_id: str = ""
     truncated: bool = False
     execution_state: str = "finished"
+    remote_task: dict | None = None
 
 
 class SSHExecutor:
@@ -127,6 +129,8 @@ class SSHExecutor:
         timeout = timeout if timeout is not None else self.config.command_timeout
         if timeout <= 0:
             raise ValueError("timeout must be positive")
+        if not self.config.execution_enabled:
+            raise ValueError("Remote execution is disabled; this host has been paused")
         budget = self.config.max_output_bytes if output_budget is None else output_budget
         if not 256 <= budget <= 1048576:
             raise ValueError("output_budget must be between 256 and 1048576 bytes")
@@ -134,7 +138,7 @@ class SSHExecutor:
             host=self.config.ssh_target, cwd=cwd, command=display_command or command, status="starting",
             stdin_bytes=len(input_data or b""), stdin_sha256=hashlib.sha256(input_data or b"").hexdigest())
         audit.add_child(audit.operation_id.get(), record_id)
-        wrapped = self._wrap_command(command, cwd, record_id, trace)
+        wrapped = self._wrap_command(command, cwd, record_id, trace, timeout, len(input_data or b""))
         audit.update(record_id, wrapped_command=wrapped, shell_trace=trace)
         if display_command is not None:
             audit.update(record_id, executed_command=command)
@@ -142,29 +146,52 @@ class SSHExecutor:
             with audit.open_stream(record_id, "stdin") as output:
                 output.write(input_data)
 
-        ssh_args = [
-            "ssh",
-            "-T",
-            "-S", self._control_path,
-            "-o", "ControlMaster=no",
-            "-o", "BatchMode=yes",
-            # OpenSSH normally falls back to a new connection when a master
-            # disappears, even after a successful -O check. An inert proxy is
-            # consulted only on that fallback path: an existing mux channel
-            # works normally, but fallback cannot dial/authenticate anywhere.
-            "-o", "ProxyCommand=false",
-        ]
-        if self.config.port != 22:
-            ssh_args.extend(["-p", str(self.config.port)])
-        ssh_args.append(self.config.ssh_target)
-        ssh_args.append(wrapped)
+        ssh_args = self._ssh_args(wrapped)
 
         started = time.monotonic()
         proc = None
         tasks = []
         actual_cwd = None
+        remote_task = {}
         marker = re.compile(rb"\x1eREMOTE_WORKBENCH_CWD_" + record_id.encode() + rb":([^\x1f]*)\x1f\n")
         stdout_marker = re.compile(rb"\x1eREMOTE_WORKBENCH_STDOUT_" + record_id.encode() + rb"\x1f\n")
+        task_marker = re.compile(rb"\x1eREMOTE_WORKBENCH_TASK_" + record_id.encode() + rb":([^\x1f]*)\x1f\n")
+
+        async def task_stream(reader):
+            """Strip task control records without mixing them into user output."""
+            pending = b""
+            prefix = b"\x1eREMOTE_WORKBENCH_TASK_" + record_id.encode() + b":"
+            while True:
+                chunk = await reader.read(65536)
+                pending += chunk
+                while True:
+                    match = task_marker.search(pending)
+                    if match:
+                        yield pending[:match.start()]
+                        try:
+                            value = json.loads(match[1])
+                            remote_task.update(value)
+                            audit.update(record_id, remote_task=dict(remote_task))
+                        except (ValueError, TypeError):
+                            pass
+                        pending = pending[match.end():]
+                        continue
+                    if not chunk:
+                        if pending:
+                            yield pending
+                        return
+                    # Retain only a possible split marker, not all stderr.
+                    position = pending.find(prefix)
+                    keep = position if position >= 0 else len(pending)
+                    if position < 0:
+                        for size in range(min(len(prefix) - 1, len(pending)), 0, -1):
+                            if prefix.startswith(pending[-size:]):
+                                keep = len(pending) - size
+                                break
+                    if keep:
+                        yield pending[:keep]
+                        pending = pending[keep:]
+                    break
         async def pump(reader, stream):
             nonlocal actual_cwd
             pending = b""
@@ -173,10 +200,7 @@ class SSHExecutor:
             startup_path = audit.directory(record_id) / ("startup_" + stream)
             with audit.open_stream(record_id, stream) as output, audit.open_stream(record_id, "startup_"+stream) as startup:
                 try:
-                    while True:
-                        chunk = await reader.read(65536)
-                        if not chunk:
-                            break
+                    async for chunk in task_stream(reader) if stream == "stderr" else ordinary_stream(reader):
                         if looking:
                             pending += chunk
                             match = pattern.search(pending)
@@ -200,28 +224,45 @@ class SSHExecutor:
                         with startup_path.open("rb") as prefix:
                             shutil.copyfileobj(prefix, output)
                         output.write(pending)
+        async def ordinary_stream(reader):
+            while chunk := await reader.read(65536):
+                yield chunk
+
         async def feed():
             if proc.stdin is not None:
                 try:
                     proc.stdin.write(input_data or b"")
                     await proc.stdin.drain()
+                    while True:
+                        proc.stdin.write(b"H\n")
+                        await proc.stdin.drain()
+                        await asyncio.sleep(1)
                 except (BrokenPipeError, ConnectionResetError):
                     pass
                 finally:
                     proc.stdin.close()
         timed_out = False
+        completion = None
         try:
             proc = await asyncio.create_subprocess_exec(*ssh_args,
-                stdin=asyncio.subprocess.PIPE if input_data is not None else asyncio.subprocess.DEVNULL,
+                stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
             audit.update(record_id, status="running")
             tasks = [asyncio.create_task(pump(proc.stdout, "stdout")),
-                     asyncio.create_task(pump(proc.stderr, "stderr")), asyncio.create_task(feed())]
-            await asyncio.wait_for(asyncio.gather(proc.wait(), *tasks), timeout=timeout)
+                     asyncio.create_task(pump(proc.stderr, "stderr"))]
+            heartbeat = asyncio.create_task(feed())
+            tasks.append(heartbeat)
+            completion = asyncio.gather(proc.wait(), *tasks[:2])
+            # The remote supervisor owns the real deadline. Leave bounded time
+            # for its TERM/KILL escalation and final control record to arrive.
+            await asyncio.wait_for(asyncio.shield(completion), timeout=timeout + self.config.terminate_grace_seconds + 5)
             exit_code = proc.returncode
+            timed_out = remote_task.get("reason") == "timeout"
         except asyncio.TimeoutError:
             timed_out = True
             exit_code = -1
+            if proc and proc.stdin:
+                proc.stdin.close()
             if proc and proc.returncode is None:
                 proc.kill()
                 await proc.wait()
@@ -231,10 +272,23 @@ class SSHExecutor:
             with audit.open_stream(record_id, "stderr") as output:
                 output.write(str(e).encode())
         except BaseException:
+            # Closing stdin cancels the foreground lease remotely; keep the SSH
+            # output channel open briefly so cleanup can be acknowledged.
+            if proc and proc.stdin:
+                proc.stdin.close()
+            if tasks:
+                tasks[-1].cancel()
+            if completion is not None:
+                try:
+                    await asyncio.wait_for(asyncio.shield(completion), self.config.terminate_grace_seconds + 4)
+                except (Exception, asyncio.CancelledError):
+                    pass
             if proc and proc.returncode is None:
                 proc.kill()
                 await proc.wait()
-            audit.update(record_id, status="cancelled", execution_state="remote_state_unknown")
+            audit.update(record_id, status="cancelled", remote_task=remote_task,
+                         execution_state="cancelled" if remote_task.get("state") == "finished" and
+                         remote_task.get("cleanup_state") != "unconfirmed" else "remote_state_unknown")
             raise
         finally:
             for task in tasks:
@@ -242,6 +296,10 @@ class SSHExecutor:
                     task.cancel()
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
+            if completion is not None:
+                if not completion.done():
+                    completion.cancel()
+                await asyncio.gather(completion, return_exceptions=True)
         contents = {}
         sizes = {}
         for stream in ("stdout", "stderr"):
@@ -273,18 +331,70 @@ class SSHExecutor:
         transport_failed = exit_code == 255 and _is_ssh_error(contents["stderr"])
         if transport_failed:
             self._last_check_ok = False
-        state = "remote_state_unknown" if timed_out or transport_failed else "finished"
+        acknowledged = remote_task.get("state") == "finished"
+        state = "finished" if acknowledged and not transport_failed and remote_task.get("cleanup_state") != "unconfirmed" else "remote_state_unknown"
         audit.update(record_id, status="timeout" if timed_out else "finished", actual_cwd=actual_cwd,
             exit_code=exit_code, execution_state=state, elapsed_ms=round((time.monotonic()-started)*1000), output_bytes=sizes,
             startup_output_bytes={name: (audit.directory(record_id)/name).stat().st_size
                                   for name in ("startup_stdout", "startup_stderr")
                                   if (audit.directory(record_id)/name).exists()})
         if timed_out:
-            # Partial output remains available; do not claim remote cancellation.
-            message = f"Timed out after {timeout}s; remote state unknown. "
+            message = (f"Timed out after {timeout}s; " +
+                       (f"cleanup: {remote_task.get('cleanup_state', 'unconfirmed')}. " if acknowledged else "remote state unknown. "))
             contents["stderr"], _ = audit.preview((message + contents["stderr"]).encode(), err_budget)
         return SSHResult(contents["stdout"], contents["stderr"], exit_code, timed_out,
-                         record_id, truncated, state)
+                         record_id, truncated, state, remote_task)
+
+    def _ssh_args(self, command):
+        # An inert fallback proxy prohibits fresh connections/authentication
+        # after loss of the existing master, including the cleanup path.
+        args = ["ssh", "-T", "-S", self._control_path, "-o", "ControlMaster=no",
+                "-o", "BatchMode=yes", "-o", "ProxyCommand=false"]
+        if self.config.port != 22:
+            args.extend(["-p", str(self.config.port)])
+        return [*args, self.config.ssh_target, command]
+
+    async def cancel_task(self, task_id: str, *, kind: str = "jobs") -> dict:
+        """Cleanup remains callable while ordinary execution is disabled.
+
+        No interactive login shell, preamble, workload runtime, or new SSH
+        authentication is invoked. The remote supervisor verifies identity.
+        """
+        if kind not in {"jobs", "tasks"} or not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", task_id):
+            raise ValueError("Invalid task handle")
+        from remote_workbench.remote_shell import python_command
+        source = Path(__file__).with_name("remote_task.py").read_text()
+        # login_spec is never used by this control-only entry point.
+        source = "login_spec = None\n" + source
+        if self.remote_state_dir:
+            source += "\nos.environ['REMOTE_WORKBENCH_REMOTE_STATE_DIR'] = " + repr(self.remote_state_dir) + "\n"
+        source += ("\ntry:\n value = cancel_task(task_state_root() / " + repr(kind) + " / " + repr(task_id) +
+                   ", wait_seconds=" + repr(self.config.terminate_grace_seconds + 3) + ")\n"
+                   "except (OSError, ValueError) as exc:\n value = {'error': 'cleanup_unconfirmed', 'message': str(exc), 'execution_state': 'unknown'}\n"
+                   "print('\\x1eREMOTE_WORKBENCH_CONTROL\\x1f' + json.dumps(value))\n")
+        wrapped = "exec " + python_command(source)
+        record = audit.create(kind="command", parent_id=audit.operation_id.get(), host=self.config.ssh_target,
+                              command=f"stop {kind}/{task_id}", status="running", wrapped_command=wrapped)
+        audit.add_child(audit.operation_id.get(), record)
+        proc = None
+        try:
+            proc = await asyncio.create_subprocess_exec(*self._ssh_args(wrapped), stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            out, err = await asyncio.wait_for(proc.communicate(), self.config.terminate_grace_seconds + 6)
+            for name, content in (("stdout", out), ("stderr", err)):
+                with audit.open_stream(record, name) as output:
+                    output.write(content)
+            marker = b"\x1eREMOTE_WORKBENCH_CONTROL\x1f"
+            value, _ = json.JSONDecoder().raw_decode(out.split(marker, 1)[1].decode())
+            audit.update(record, status="finished", remote_task=value, exit_code=proc.returncode)
+            return dict(value, output_id=record)
+        except (OSError, ValueError, IndexError, asyncio.TimeoutError) as exc:
+            audit.update(record, status="failed", execution_state="unknown", error=str(exc))
+            return {"error": "cleanup_unconfirmed", "execution_state": "unknown", "output_id": record}
+        finally:
+            if proc is not None and proc.returncode is None:
+                proc.kill()
+                await proc.wait()
 
     async def run_program(self, argv: list[str], cwd: str | None = None,
                           timeout: int | None = None, output_budget: int | None = None,
@@ -328,7 +438,8 @@ class SSHExecutor:
         """Force next check_connection to actually probe the socket."""
         self._last_check_ok = False
 
-    def _wrap_command(self, command: str, cwd: str, record_id: str = "", trace: bool = False) -> str:
+    def _wrap_command(self, command: str, cwd: str, record_id: str = "", trace: bool = False,
+                      timeout: int | None = None, stdin_bytes: int = 0) -> str:
         """Start the configured account shell, without assuming its syntax."""
         from remote_workbench.remote_shell import python_command
         markers = None
@@ -336,12 +447,18 @@ class SSHExecutor:
             markers = {"stdout": f"\x1eREMOTE_WORKBENCH_STDOUT_{record_id}\x1f\n",
                        "stderr": f"\x1eREMOTE_WORKBENCH_CWD_{record_id}:%s\x1f\n"}
         environment = {"REMOTE_WORKBENCH_REMOTE_STATE_DIR": self.remote_state_dir} if self.remote_state_dir else {}
+        task_id = record_id or __import__("uuid").uuid4().hex
         arguments = dict(command=command, cwd=cwd, preamble=self.config.preamble,
-                         markers=markers, trace=trace, environment=environment)
+                         markers=markers, trace=trace, environment=environment,
+                         policy=self.config.task_policy(), timeout=timeout or self.config.command_timeout,
+                         task_id=task_id, stdin_bytes=stdin_bytes)
         bootstrap = Path(__file__).with_name("remote_shell.py").read_text()
-        bootstrap += "\n_spec = login_spec(**" + repr(arguments) + ")\n"
-        bootstrap += "_env = dict(os.environ, **_spec['env_updates'])\n"
-        bootstrap += "os.execvpe(_spec['shell'], _spec['argv'], _env)\n"
+        bootstrap += "\n" + Path(__file__).with_name("remote_task.py").read_text()
+        bootstrap += "\n_settings = " + repr(arguments) + "\n"
+        if self.remote_state_dir:
+            bootstrap += "os.environ['REMOTE_WORKBENCH_REMOTE_STATE_DIR'] = " + repr(self.remote_state_dir) + "\n"
+        bootstrap += "_settings['task_dir'] = str(task_state_root() / 'tasks' / _settings['task_id'])\n"
+        bootstrap += "raise SystemExit(supervise_task(_settings))\n"
         return "exec " + python_command(bootstrap)
 
 

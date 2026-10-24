@@ -24,6 +24,7 @@ from remote_workbench.config import load_config
 from remote_workbench.audit_web import Handler as AuditViewerHandler, handler_for_directory
 from remote_workbench.server import workspace_executor
 from remote_workbench.ssh import SSHExecutor
+from remote_workbench.compute_review import REVIEW_INSTRUCTIONS
 from remote_workbench.tools import commands, files, git, search, patch, audit as audit_tools
 
 
@@ -85,6 +86,7 @@ TOOLS = [
     ("git_diff", git.ssh_git_diff, "Default compact numstat; mode='patch' returns paged hunks. Continue with output_id/next_cursor to reuse the snapshot."),
     ("start_job", commands.ssh_run_background, "Start an explicit detached remote job in a fresh default shell. Returns job_id; poll using job_status."),
     ("job_status", commands.ssh_job_status, "Read detached job state and incremental output. Reuse returned byte cursors."),
+    ("stop_job", commands.ssh_stop_job, "Cancel a supervised job on its originating node. Inspect cleanup_state; remains available when execution is disabled."),
     ("read_output", audit_tools.ssh_read_output, "Page saved output by output_id, stream and byte cursor; full command output and edit diffs are retained locally."),
     ("audit_get", audit_tools.ssh_audit_get, "Read a local operation record, including actual remote commands and child IDs."),
     ("audit_list", audit_tools.ssh_audit_list, "List recent local operation metadata."),
@@ -186,6 +188,7 @@ def create_server(workspace: Workspace, *, viewer_url: str | None = None, sessio
         "Control and audit records stay local; only shell/Python workers run remotely. "
         "On SSH failure stop and report; never fall back to local project execution. "
         "This is a default directory, not a filesystem sandbox."
+        + REVIEW_INSTRUCTIONS
         + (f" Local audit viewer: {viewer_url}. Every tool result supplies operation_log. "
            "Whenever you use these tools, include its Markdown link with the exact bold title "
            "'Remote Workbench 操作记录' in your user-facing update and final reply. "

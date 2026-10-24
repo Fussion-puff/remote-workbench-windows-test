@@ -10,7 +10,7 @@ from remote_workbench.ssh import SSHExecutor, SSHResult
 @pytest.fixture
 def host_config():
     return HostConfig(
-        ssh_host="test.example.com",
+        ssh_host="test.example.com", execution_enabled=True,
         user="testuser",
         preamble="source ~/env.sh",
         default_cwd="~/project",
@@ -50,7 +50,8 @@ async def local(tmp_path, monkeypatch):
                    PATH=str(Path(sys.executable).parent)+os.pathsep+os.environ['PATH'])
         return await real_create('/bin/bash', '--noprofile', '--norc', '-c', script, env=env, **kwargs)
     monkeypatch.setattr('remote_workbench.ssh.asyncio.create_subprocess_exec', transport)
-    executor = SSHExecutor(HostConfig(ssh_host='local-simulated', default_cwd=str(tmp_path)))
+    executor = SSHExecutor(HostConfig(ssh_host='local-simulated', execution_enabled=True, terminate_grace_seconds=1, default_cwd=str(tmp_path)))
     for module in (files, git, commands, patch, search):
         monkeypatch.setattr(module, 'require_connection', AsyncMock(return_value=executor))
+    monkeypatch.setattr(commands, 'get_executor', lambda host=None: executor)
     return executor, tmp_path

@@ -12,4 +12,6 @@ The 0.3.0a3 development changes correct the workspace-history limit schema to an
 
 The 0.3.0a4 development changes repair audit-viewer live refresh, follow new operations while allowing history review, refresh saved output through command completion, and add browser-script behaviour regression checks.
 
+The 0.3.0a5 development changes add a shared foreground/background process supervisor, owned-process-group cleanup, independent cancellation controls, and an explicit user-review workflow for substantial computation. They do not require cgroup delegation or impose an account-wide process limit. Source distributions now explicitly select public project files, excluding local runtime/configuration directories. These changes have not been promoted to the independent stable installation.
+
 The upstream README is preserved in [README.upstream.md](README.upstream.md). The [LICENSE](LICENSE) is preserved. This derivative is distributed under GNU AGPL version 3; retain upstream copyright, license, and warranty notices when redistributing it. This provenance notice identifies the source lineage and does not claim authorship of upstream work.

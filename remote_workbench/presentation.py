@@ -29,6 +29,7 @@ _TOOL_TITLES = {
     "ssh_check_connection": "检查远端连接",
     "ssh_run_background": "启动后台任务",
     "ssh_job_status": "查看后台任务",
+    "ssh_stop_job": "停止后台任务",
     "ssh_read_file": "查看文件",
     "ssh_write_file": "写入文件",
     "ssh_append_file": "追加文件内容",

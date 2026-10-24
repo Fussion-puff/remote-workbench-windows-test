@@ -54,12 +54,15 @@ async def test_budget_and_full_spool(local):
 
 
 @pytest.mark.asyncio
-async def test_timeout_retains_output_and_unknown_state(local):
+async def test_remote_deadline_retains_output_and_cleanup_evidence(local):
     executor, _ = local
     # Include enough time for native shell/Python startup before interrupting
     # the command; a 200 ms startup deadline cannot promise any stdout yet.
     result = await executor.run("printf partial; exec sleep 10", timeout=2)
-    assert result.timed_out and result.execution_state == 'remote_state_unknown'
+    assert result.timed_out and result.execution_state == 'finished'
+    assert result.remote_task['reason'] == 'timeout'
+    assert result.remote_task['cleanup_state'] == 'process_group_signalled'
+    assert result.remote_task['tree_confirmed'] is False
     assert (audit.directory(result.output_id)/'stdout').read_text() == 'partial'
 
 

@@ -43,7 +43,7 @@ async def test_disappeared_master_cannot_fall_back_to_a_new_tcp_connection(tmp_p
         # personal SSH configuration. This still executes the real OpenSSH.
         return await real_create(ssh, "-F", str(empty_config), *args[1:], **kwargs)
     monkeypatch.setattr("remote_workbench.ssh.asyncio.create_subprocess_exec", isolated_transport)
-    executor = SSHExecutor(HostConfig(ssh_host="127.0.0.1", port=port, control_path=str(control), default_cwd="/tmp"))
+    executor = SSHExecutor(HostConfig(ssh_host="127.0.0.1", execution_enabled=True, port=port, control_path=str(control), default_cwd="/tmp"))
     executor._last_check_ok = True
     executor._last_check = asyncio.get_running_loop().time()
     try:

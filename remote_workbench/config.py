@@ -24,6 +24,22 @@ class HostConfig:
     max_file_size: int = 10 * 1024 * 1024  # 10MB
     max_output_lines: int = 200
     max_output_bytes: int = 16384
+    execution_enabled: bool = True
+    job_timeout: int = 3600
+    terminate_grace_seconds: int = 2
+    compute_review_threshold: int = 8
+
+    def __post_init__(self):
+        if not isinstance(self.execution_enabled, bool):
+            raise ValueError("execution_enabled must be a boolean")
+        for name in ("job_timeout", "terminate_grace_seconds", "compute_review_threshold"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+
+    def task_policy(self) -> dict:
+        return {name: getattr(self, name) for name in (
+            "execution_enabled", "job_timeout", "terminate_grace_seconds")}
 
     @property
     def resolved_control_path(self) -> str:

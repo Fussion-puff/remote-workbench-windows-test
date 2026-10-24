@@ -15,7 +15,7 @@ from remote_workbench.workspace import Workspace, bind_tool, create_server
 def manifest(tmp_path, **overrides):
     config = tmp_path / "hosts.yaml"
     config.write_text(yaml.safe_dump({"hosts": {"remote": {
-        "ssh_host": "server", "preamble": "source old-env/bin/activate"
+        "ssh_host": "server", "execution_enabled": True, "preamble": "source old-env/bin/activate"
     }}}))
     data = {"version": 1, "name": "test", "host": "remote", "cwd": "/remote/project", "config": "hosts.yaml"}
     data.update(overrides)
@@ -42,7 +42,7 @@ def test_manifest_rejects_invalid_bindings(tmp_path, fields):
 async def test_public_schemas_have_no_host_and_optional_cwd(tmp_path):
     workspace = Workspace.load(manifest(tmp_path))
     tools = await create_server(workspace).list_tools()
-    assert len(tools) == 16
+    assert len(tools) == 17
     schemas = {tool.name: tool.inputSchema for tool in tools}
     assert all("host" not in schema["properties"] for schema in schemas.values())
     assert all(tool.outputSchema is None for tool in tools)

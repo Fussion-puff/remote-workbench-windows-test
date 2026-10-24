@@ -1,6 +1,8 @@
 """Tests for SSHExecutor command wrapping and result handling."""
 
 import pytest
+import asyncio
+from unittest.mock import patch
 import os
 import subprocess
 import sys
@@ -12,12 +14,17 @@ from remote_workbench.ssh import SSHExecutor, SSHResult, _is_ssh_error
 
 class TestCommandWrapping:
     def run_wrapped(self, command, cwd, home, preamble=""):
-        executor = SSHExecutor(HostConfig(ssh_host="test", preamble=preamble))
+        executor = SSHExecutor(HostConfig(ssh_host="test", preamble=preamble, execution_enabled=True))
         env = dict(os.environ, HOME=str(home), ZDOTDIR=str(home),
                    REMOTE_WORKBENCH_LOGIN_SHELL="/bin/sh",
+                   REMOTE_WORKBENCH_AUDIT_DIR=str(home / "audit"),
                    PATH=str(Path(sys.executable).parent) + os.pathsep + os.environ["PATH"])
-        return subprocess.run(["/bin/sh", "-c", executor._wrap_command(command, str(cwd))],
-                              env=env, capture_output=True, text=True, timeout=10)
+        real_create = asyncio.create_subprocess_exec
+        async def transport(*args, **kwargs):
+            return await real_create("/bin/sh", "-c", args[-1], env=env, **kwargs)
+        with patch("remote_workbench.ssh.asyncio.create_subprocess_exec", transport), patch.dict(os.environ, env):
+            value = asyncio.run(executor.run(command, str(cwd), timeout=10))
+        return subprocess.CompletedProcess([], value.exit_code, value.stdout, value.stderr)
 
     def test_wrap_applies_preamble(self, tmp_path):
         value = self.run_wrapped('printf "%s" "$REMOTE_WORKBENCH_TEST_VALUE"', tmp_path, tmp_path,

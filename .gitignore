@@ -22,6 +22,8 @@ build/
 Thumbs.db
 
 # Remote Workbench runtime
+/.local/
+/.codex/
 /config.yaml
 /workspace.json
 *.local.yaml

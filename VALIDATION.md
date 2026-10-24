@@ -1,5 +1,13 @@
 # Validation status
 
+## Develop task lifecycle and compute review (0.3.0a5) — 2026-10-24
+
+- Final local regression suite: 316 tests passed (121.95 seconds), using simulated SSH and bounded local processes.
+- Coverage includes cancellation, controller disconnect/heartbeat expiry, foreground and detached deadlines, owned-group cleanup, identity mismatch refusal, job stopping after workspace switches, and compute-review refusal before remote execution. Six local shell variants remain covered.
+- Wheel and source-distribution builds passed. Archive inspection confirmed that private runtime/configuration directories are absent. The extracted wheel imported the new modules, advertised the cleanup entry point, exposed 17 fixed-workspace and 20 session tools, and its remote worker source parsed with Python 3.9 syntax compatibility.
+- No IHEP/CERN commands or resource-exhaustion reproductions were run for this version. Cluster acceptance is still pending. The independent stable installation remains 0.2.4.
+- Process-group cleanup is best effort for processes which stay in that group. Compute approval is an agent-reported user-confirmation workflow, not an OS sandbox or independently verified chat authorization; see [task lifecycle boundaries](docs/process-safety.zh-CN.md).
+
 ## Current account-shell update (0.2.1) — 2026-10-23
 
 - Full regression suite: 192 tests passed (33.87 seconds).

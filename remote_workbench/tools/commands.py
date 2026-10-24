@@ -2,31 +2,43 @@
 from __future__ import annotations
 import re
 import uuid
-from remote_workbench.server import mcp, require_connection
+from remote_workbench.server import mcp, require_connection, get_executor
 from remote_workbench.remote_client import edit
+from remote_workbench.compute_review import check_compute_review
 
 _SAFE_JOB_ID = re.compile(r"^[a-zA-Z0-9_-]{1,80}$")
 
 
 @mcp.tool()
 async def ssh_run(command: str, cwd: str | None = None, timeout: int | None = None,
-                  host: str | None = None, max_bytes: int = 16384, trace: bool = False) -> dict:
+                  host: str | None = None, max_bytes: int = 16384, trace: bool = False,
+                  compute_review: dict | None = None) -> dict:
     """Execute using the remote default shell's interactive login configuration.
 
     Return head/tail previews bounded by a shared stdout+stderr byte budget.
-    Timeout means remote execution state is unknown, not confirmed cancellation.
+    A remote supervisor enforces the deadline and cleans its workload scope.
+    Inspect remote_task.cleanup_state; transport loss can leave state unknown.
     trace=True saves expanded shell command steps in stderr, including arguments.
+    Substantial computation requires explicit user confirmation of command,
+    concurrency and environment; record it in compute_review. No OS PID cap.
     """
+    config = get_executor(host).config
+    pending = check_compute_review(command, cwd or config.default_cwd, config.ssh_target,
+                                   compute_review, config.compute_review_threshold)
+    if pending:
+        return pending
     executor = await require_connection(host)
     result = await executor.run(command, cwd=cwd, timeout=timeout, output_budget=max_bytes, trace=trace)
     return {"stdout": result.stdout, "stderr": result.stderr, "exit_code": result.exit_code,
             "timed_out": result.timed_out, "truncated": result.truncated,
-            "output_id": result.output_id, "execution_state": result.execution_state}
+            "output_id": result.output_id, "execution_state": result.execution_state,
+            "remote_task": result.remote_task}
 
 
 @mcp.tool()
-async def ssh_run_background(command: str, cwd: str | None = None, job_id: str = "", host: str | None = None) -> dict:
-    """Start a detached job. Wrapper records the actual command exit code.
+async def ssh_run_background(command: str, cwd: str | None = None, job_id: str = "", host: str | None = None,
+                             timeout: int | None = None, compute_review: dict | None = None) -> dict:
+    """Start a supervised detached job with a finite remote deadline.
 
     Job directories are private and exclusive. Poll using returned byte cursors
     to avoid repeatedly receiving the same output.
@@ -34,9 +46,28 @@ async def ssh_run_background(command: str, cwd: str | None = None, job_id: str =
     job_id = job_id or uuid.uuid4().hex
     if not _SAFE_JOB_ID.fullmatch(job_id):
         return {"error": "invalid_job_id"}
+    config = get_executor(host).config
+    pending = check_compute_review(command, cwd or config.default_cwd, config.ssh_target,
+                                   compute_review, config.compute_review_threshold)
+    if pending:
+        return pending
     executor = await require_connection(host)
-    return await edit(executor, {"op": "job_start", "job_id": job_id, "command": command},
+    if timeout is not None and timeout <= 0:
+        raise ValueError("timeout must be positive")
+    return await edit(executor, {"op": "job_start", "job_id": job_id, "command": command, "timeout": timeout},
                       cwd=cwd or executor.config.default_cwd)
+
+
+@mcp.tool()
+async def ssh_stop_job(job_id: str, host: str | None = None) -> dict:
+    """Request TERM -> KILL of a supervised job, even with execution disabled.
+
+    Refuses foreign-node, reused-PID and legacy handles. Acknowledgement is
+    separate from a request; inspect cleanup_state and tree_confirmed.
+    """
+    if not _SAFE_JOB_ID.fullmatch(job_id):
+        return {"error": "invalid_job_id"}
+    return await get_executor(host).cancel_task(job_id)
 
 
 @mcp.tool()

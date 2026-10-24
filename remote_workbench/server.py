@@ -11,6 +11,7 @@ from remote_workbench import audit
 
 from remote_workbench.config import get_config, HostConfig
 from remote_workbench.ssh import SSHExecutor
+from remote_workbench.compute_review import REVIEW_INSTRUCTIONS
 
 class AuditedMCP(FastMCP):
     def tool(self, *args, **kwargs):
@@ -52,6 +53,7 @@ mcp = AuditedMCP(
         "ssh_git_diff defaults to summary; mode='patch' pages a saved snapshot. Use output_id "
         "with ssh_read_output for full saved output. Verify edits with diff/status and relevant checks. "
         "If disconnected, ask the user to reconnect."
+        + REVIEW_INSTRUCTIONS
     ),
 )
 

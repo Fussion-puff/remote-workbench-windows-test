@@ -176,103 +176,12 @@ def read_lines(request):
 
 
 
-# Detached Python supervisor: startup output stays separate from command logs.
-JOB_SUPERVISOR = r"""
-import os, sys, subprocess, threading, shutil
-from pathlib import Path
-root = Path(settings['job_dir'])
-def forward(reader, name):
-    marker = settings['markers'][name]
-    output = getattr(sys, name).buffer
-    pending = b''
-    started = False
-    startup_path = root / ('startup_' + name + '.log')
-    with open(startup_path, 'wb', opener=lambda p,f: os.open(p,f,0o600)) as startup:
-        for chunk in iter(lambda: reader.read1(65536), b''):
-            if started:
-                output.write(chunk)
-                output.flush()
-                continue
-            pending += chunk
-            offset = pending.find(marker)
-            if offset >= 0:
-                startup.write(pending[:offset])
-                output.write(pending[offset+len(marker):])
-                output.flush()
-                pending = b''
-                started = True
-            elif len(pending) > 65536:
-                startup.write(pending[:-1024])
-                pending = pending[-1024:]
-        if not started:
-            startup.flush()
-            with startup_path.open('rb') as prefix:
-                shutil.copyfileobj(prefix, output)
-            output.write(pending)
-            output.flush()
-try:
-    process = subprocess.Popen(settings['argv'], executable=settings['shell'],
-        env=dict(os.environ, **settings['env_updates']),
-        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    threads = [threading.Thread(target=forward, args=(getattr(process, name), name)) for name in ('stdout','stderr')]
-    for thread in threads: thread.start()
-    code = process.wait()
-    for thread in threads: thread.join()
-except OSError as exc:
-    print(str(exc), file=sys.stderr)
-    code = 127
-code = code if code >= 0 else 128 - code
-with open(root/'exit_code.tmp', 'w', opener=lambda p,f: os.open(p,f,0o600)) as output:
-    output.write(str(code))
-os.replace(str(root/'exit_code.tmp'), str(root/'exit_code'))
-sys.exit(code)
-"""
-
-
-def machine_identity():
-    value = {"node": os.uname().nodename, "boot_id": None}
-    try:
-        value["boot_id"] = Path("/proc/sys/kernel/random/boot_id").read_text().strip() or None
-    except OSError:
-        pass
-    return value
-
-
-def process_start(pid):
-    """A birth marker, never just PID existence. Missing proof means unknown."""
-    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
-        return None
-    if Path("/proc").is_dir():
-        try:
-            data = Path(f"/proc/{pid}/stat").read_text()
-            fields = data[data.rindex(")") + 2:].split()
-            return "proc:" + fields[19] if fields[0] != "Z" else None
-        except (OSError, ValueError, IndexError):
-            return None
-    # BSD/macOS fallback. Linux cluster nodes use the stronger /proc marker.
-    try:
-        result = subprocess.run(["ps", "-p", str(pid), "-o", "lstart="],
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=2)
-        return "ps:" + result.stdout.decode().strip() if result.returncode == 0 and result.stdout.strip() else None
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-
-
-def job_liveness(origin):
-    current = machine_identity()
-    detail = {"origin_node": origin.get("node"), "observed_node": current["node"]}
-    if not isinstance(origin.get("node"), str) or not isinstance(origin.get("start_token"), str) or not origin["start_token"]:
-        return None, dict(detail, state_reason="identity_unavailable")
-    if origin["node"] != current["node"]:
-        return None, dict(detail, state_reason="different_node")
-    if origin.get("boot_id") and origin["boot_id"] != current["boot_id"]:
-        return None, dict(detail, state_reason="different_boot")
-    if origin["start_token"].startswith("proc:") and not origin.get("boot_id"):
-        return None, dict(detail, state_reason="boot_identity_unavailable")
-    observed = process_start(origin.get("pid"))
-    if observed != origin["start_token"]:
-        return None, dict(detail, state_reason="process_unconfirmed")
-    return True, {}
+# The same supervisor owns foreground and detached workload lifecycles.
+if "supervise_task" not in globals():
+    from remote_workbench.remote_task import machine_identity, process_start, job_liveness, supervise_task
+if "TASK_SUPERVISOR_SOURCE" not in globals():
+    TASK_SUPERVISOR_SOURCE = (Path(__file__).with_name("remote_shell.py").read_text() + "\n" +
+                              Path(__file__).with_name("remote_task.py").read_text())
 
 
 def job(request):
@@ -288,20 +197,30 @@ def job(request):
         # A separate supervisor captures even an explicit `exit` in the user
         # command, while the command itself uses the same native shell as exec.
         prefix = "\x1eREMOTE_WORKBENCH_JOB_" + request["job_id"]
-        markers = {name: (prefix + "_" + name + "\x1f\n").encode() for name in ("stdout", "stderr")}
-        spec = login_spec(request["command"], os.getcwd(),
-                          markers={key: value.decode() for key, value in markers.items()})
-        settings = dict(spec, job_dir=str(path), markers=markers)
-        script = "settings = " + repr(settings) + "\n" + JOB_SUPERVISOR
+        markers = {name: prefix + "_" + name + "\x1f\n" for name in ("stdout", "stderr")}
+        policy = request["_task_policy"]
+        settings = dict(command=request["command"], cwd=os.getcwd(), task_id=request["job_id"],
+                        task_dir=str(path), markers=markers, policy=policy,
+                        timeout=request.get("timeout") or policy["job_timeout"],
+                        detached=True, directory_exists=True)
+        script = TASK_SUPERVISOR_SOURCE + "\nsettings = " + repr(settings) + "\nraise SystemExit(supervise_task(settings))\n"
         with open(runner, "w", opener=lambda p, f: os.open(p, f, 0o600)) as output:
             output.write(script)
         with open(path / "stdout.log", "wb", opener=lambda p, f: os.open(p, f, 0o600)) as out, open(path / "stderr.log", "wb", opener=lambda p, f: os.open(p, f, 0o600)) as err:
             process = subprocess.Popen([sys.executable, str(runner)], stdin=subprocess.DEVNULL,
                 stdout=out, stderr=err, start_new_session=True)
-        origin = dict(machine_identity(), version=1, pid=process.pid, start_token=process_start(process.pid))
-        atomic_write(path / "origin.json", json.dumps(origin).encode(), None)
         atomic_write(path / "pid", str(process.pid).encode(), None)
-        return {"job_id": request["job_id"], "pid": process.pid, "job_dir": str(path), "node": origin["node"]}
+        # Record supervisor identity before returning a handle. Even a launch
+        # failure leaves a finite-deadline supervisor, never an unowned command.
+        import time
+        deadline = time.monotonic() + 3
+        while not (path / "status.json").exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        if not (path / "status.json").exists():
+            return {"error": "job_start_unconfirmed", "job_id": request["job_id"], "pid": process.pid}
+        status = json.loads((path / "status.json").read_text())
+        return {"job_id": request["job_id"], "pid": process.pid, "job_dir": str(path),
+                "node": status["node"], "pgid": status.get("pgid"), "remote_task": status}
     if not path.is_dir():
         return {"error": "job_not_found"}
     exit_path = path / "exit_code"
@@ -319,6 +238,10 @@ def job(request):
         exit_code = None
     result = {"job_id": request["job_id"], "running": running, "exit_code": exit_code,
               "execution_state": "running" if running else ("finished" if exit_code is not None else "unknown"), **detail}
+    if (path / "status.json").exists():
+        result["remote_task"] = json.loads((path / "status.json").read_text())
+        if result["remote_task"].get("cleanup_state") == "unconfirmed":
+            result["execution_state"] = "unknown"
     for stream in ("stdout", "stderr"):
         cursor = request[stream + "_cursor"]
         logfile = path / (stream + ".log")

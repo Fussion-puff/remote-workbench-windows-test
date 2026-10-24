@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.0a5 (develop) — 2026-10-24
+
+- Supervise foreground commands and detached jobs with owned process groups, remote deadlines, foreground heartbeats, and TERM-to-KILL cleanup.
+- Add `stop_job` and the independent `remote-workbench-cleanup` entry point, with node and process-identity checks and original-target routing.
+- Require explicit user confirmation of substantial compute plans through the agent workflow; ordinary operations remain direct, without cgroup requirements or an account-wide process cap.
+- Select public source-distribution files explicitly so local configuration, virtual environments, audit records and runtime data stay out of packages.
+- Run CI for pushes to develop as well as main. This development release does not update the independent stable installation.
+
 ## 0.2.1 — 2026-10-23
 
 - Use the remote account's configured login shell for commands and detached jobs, with no zsh fallback or fixed-zsh live-test requirement.
