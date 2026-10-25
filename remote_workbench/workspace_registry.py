@@ -7,6 +7,8 @@ import os
 from pathlib import Path
 import sqlite3
 import json
+import posixpath
+import re
 from typing import Iterator
 import uuid
 
@@ -45,6 +47,11 @@ class JobOperation:
     target: WorkspaceTarget
     created_at: str
     updated_at: str
+    origin_nonce: str | None = None
+    launch_cwd: str | None = None
+    remote_state_dir: str | None = None
+    actual_cwd: str | None = None
+    ssh_target: str | None = None
 
 
 class RevisionConflict(ValueError):
@@ -126,6 +133,11 @@ class Registry:
                            source_cwd TEXT NOT NULL,
                            cwd TEXT,
                            project_root TEXT,
+                           origin_nonce TEXT,
+                           launch_cwd TEXT,
+                           remote_state_dir TEXT,
+                           actual_cwd TEXT,
+                           ssh_target TEXT,
                            PRIMARY KEY(workspace_id, job_id)
                        )"""
                 )
@@ -141,6 +153,11 @@ class Registry:
                            source_cwd TEXT NOT NULL,
                            cwd TEXT,
                            project_root TEXT,
+                           origin_nonce TEXT,
+                           launch_cwd TEXT,
+                           remote_state_dir TEXT,
+                           actual_cwd TEXT,
+                           ssh_target TEXT,
                            state TEXT NOT NULL,
                            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -148,6 +165,14 @@ class Registry:
                            UNIQUE(workspace_id, job_id)
                        )"""
                 )
+                # These nullable fields are an additive compatibility layer.
+                # Existing job origins remain readable, but without a nonce
+                # they cannot be safely recovered after a lost launch reply.
+                for table in ("jobs", "job_operations"):
+                    columns = {row[1] for row in db.execute(f"PRAGMA table_info({table})")}
+                    for name in ("origin_nonce", "launch_cwd", "remote_state_dir", "actual_cwd", "ssh_target"):
+                        if name not in columns:
+                            db.execute(f"ALTER TABLE {table} ADD COLUMN {name} TEXT")
                 db.execute(
                     "CREATE INDEX IF NOT EXISTS target_history_recent "
                     "ON target_history(workspace_id, revision DESC)"
@@ -402,9 +427,14 @@ class Registry:
         return [dict(row) for row in rows]
 
     def register_job(
-        self, workspace_id: str, job_id: str, target: WorkspaceTarget
+        self, workspace_id: str, job_id: str, target: WorkspaceTarget, *,
+        origin_nonce: str | None = None, launch_cwd: str | None = None,
+        remote_state_dir: str | None = None, ssh_target: str | None = None,
     ) -> None:
         self._validate_target(workspace_id, target)
+        self._validate_job_origin(origin_nonce, launch_cwd, remote_state_dir)
+        if ssh_target is not None and (not isinstance(ssh_target, str) or not ssh_target):
+            raise ValueError("ssh_target must be a non-empty string or None")
         if not isinstance(job_id, str) or not job_id:
             raise ValueError("job_id must be a non-empty string")
         with self._transaction() as db:
@@ -430,9 +460,10 @@ class Registry:
                 return
             db.execute(
                 """INSERT INTO jobs
-                   (workspace_id, job_id, target_id, host, source_cwd, cwd, project_root)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                (workspace_id, job_id, *snapshot),
+                   (workspace_id, job_id, target_id, host, source_cwd, cwd, project_root,
+                    origin_nonce, launch_cwd, remote_state_dir, ssh_target)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (workspace_id, job_id, *snapshot, origin_nonce, launch_cwd, remote_state_dir, ssh_target),
             )
 
     def get_job(self, workspace_id: str, job_id: str) -> WorkspaceTarget:
@@ -451,6 +482,40 @@ class Registry:
             cwd=row["cwd"],
             project_root=row["project_root"],
         )
+
+    @staticmethod
+    def _validate_job_origin(origin_nonce, launch_cwd, remote_state_dir):
+        if origin_nonce is not None and (
+                not isinstance(origin_nonce, str) or
+                not re.fullmatch(r"[a-f0-9]{32}", origin_nonce)):
+            raise ValueError("origin_nonce must be 32 lowercase hexadecimal characters")
+        for name, value in (("launch_cwd", launch_cwd), ("remote_state_dir", remote_state_dir)):
+            if value is not None and (not isinstance(value, str) or not posixpath.isabs(value) or "\x00" in value):
+                raise ValueError(f"{name} must be an absolute remote path or None")
+
+    def get_job_origin(self, workspace_id: str, job_id: str) -> dict:
+        """Read the immutable target and launch identity saved before submission."""
+        with self._connection() as db:
+            row = db.execute(
+                "SELECT * FROM jobs WHERE workspace_id = ? AND job_id = ?",
+                (workspace_id, job_id),
+            ).fetchone()
+        if row is None:
+            raise ValueError(f"Unknown job for workspace: {job_id}")
+        return {
+            "workspace_id": row["workspace_id"],
+            "job_id": row["job_id"],
+            "target": WorkspaceTarget(
+                target_id=row["target_id"], workspace_id=row["workspace_id"],
+                host=row["host"], source_cwd=row["source_cwd"],
+                cwd=row["cwd"], project_root=row["project_root"],
+            ),
+            "origin_nonce": row["origin_nonce"],
+            "launch_cwd": row["launch_cwd"],
+            "remote_state_dir": row["remote_state_dir"],
+            "actual_cwd": row["actual_cwd"],
+            "ssh_target": row["ssh_target"],
+        }
 
     def list_jobs(self, workspace_id: str, limit: int | None = None, offset: int = 0) -> list[dict]:
         """List job handles in newest-registration order with optional pagination.
@@ -501,11 +566,18 @@ class Registry:
             ),
             created_at=row["created_at"],
             updated_at=row["updated_at"],
+            origin_nonce=row["origin_nonce"],
+            launch_cwd=row["launch_cwd"],
+            remote_state_dir=row["remote_state_dir"],
+            actual_cwd=row["actual_cwd"],
+            ssh_target=row["ssh_target"],
         )
 
     def reserve_job_operation(
         self, workspace_id: str, idempotency_key: str, target: WorkspaceTarget,
-        job_id: str, command_fingerprint: str,
+        job_id: str, command_fingerprint: str, *, origin_nonce: str | None = None,
+        launch_cwd: str | None = None, remote_state_dir: str | None = None,
+        ssh_target: str | None = None,
     ) -> tuple[JobOperation, bool]:
         """Atomically bind a key to one target/job before any remote submission.
 
@@ -514,6 +586,9 @@ class Registry:
         requests again under a conflicting key.
         """
         self._validate_target(workspace_id, target)
+        self._validate_job_origin(origin_nonce, launch_cwd, remote_state_dir)
+        if ssh_target is not None and (not isinstance(ssh_target, str) or not ssh_target):
+            raise ValueError("ssh_target must be a non-empty string or None")
         if not isinstance(idempotency_key, str) or not idempotency_key:
             raise ValueError("idempotency_key must be non-empty text")
         if not isinstance(job_id, str) or not job_id:
@@ -539,6 +614,12 @@ class Registry:
                 if (saved_target != target_fields or
                         existing["command_fingerprint"] != command_fingerprint):
                     raise ValueError("idempotency_key is already bound to different job parameters")
+                for name, requested in (("launch_cwd", launch_cwd),
+                                        ("remote_state_dir", remote_state_dir),
+                                        ("ssh_target", ssh_target)):
+                    saved = existing[name]
+                    if saved is not None and requested is not None and saved != requested:
+                        raise ValueError("idempotency_key is already bound to different job parameters")
                 return self._job_operation(existing), False
 
             collision = db.execute(
@@ -549,16 +630,19 @@ class Registry:
                 raise ValueError("job_id is already registered; use a new idempotency_key")
             db.execute(
                 """INSERT INTO jobs
-                   (workspace_id, job_id, target_id, host, source_cwd, cwd, project_root)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                (workspace_id, job_id, *target_fields),
+                   (workspace_id, job_id, target_id, host, source_cwd, cwd, project_root,
+                    origin_nonce, launch_cwd, remote_state_dir, ssh_target)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (workspace_id, job_id, *target_fields, origin_nonce, launch_cwd, remote_state_dir, ssh_target),
             )
             db.execute(
                 """INSERT INTO job_operations
                    (workspace_id, idempotency_key, job_id, command_fingerprint,
-                    target_id, host, source_cwd, cwd, project_root, state)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'reserved')""",
-                (workspace_id, idempotency_key, job_id, command_fingerprint, *target_fields),
+                    target_id, host, source_cwd, cwd, project_root, origin_nonce,
+                    launch_cwd, remote_state_dir, ssh_target, state)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'reserved')""",
+                (workspace_id, idempotency_key, job_id, command_fingerprint, *target_fields,
+                 origin_nonce, launch_cwd, remote_state_dir, ssh_target),
             )
             row = db.execute(
                 "SELECT * FROM job_operations WHERE workspace_id = ? AND idempotency_key = ?",
@@ -593,14 +677,63 @@ class Registry:
             ).fetchone()
             return self._job_operation(row)
 
-    def reopen_rejected_job_operation(self, workspace_id: str, idempotency_key: str) -> bool:
-        """Permit an explicit retry only after a tool confirmed no execution."""
+    def update_job_actual_cwd(self, workspace_id: str, job_id: str, actual_cwd: str) -> None:
+        """Persist the remote physical cwd only after origin identity was verified."""
+        if not isinstance(actual_cwd, str) or not posixpath.isabs(actual_cwd) or "\x00" in actual_cwd:
+            raise ValueError("actual_cwd must be an absolute remote path")
         with self._transaction() as db:
-            cursor = db.execute(
-                """UPDATE job_operations SET state = 'reserved', updated_at = CURRENT_TIMESTAMP
-                   WHERE workspace_id = ? AND idempotency_key = ? AND state = 'rejected'""",
-                (workspace_id, idempotency_key),
+            row = db.execute(
+                "SELECT actual_cwd FROM jobs WHERE workspace_id = ? AND job_id = ?",
+                (workspace_id, job_id),
+            ).fetchone()
+            if row is None:
+                raise ValueError("Unknown job for workspace")
+            if row["actual_cwd"] not in (None, actual_cwd):
+                raise ValueError("Verified job actual_cwd conflicts with the saved origin")
+            db.execute(
+                "UPDATE jobs SET actual_cwd = COALESCE(actual_cwd, ?) WHERE workspace_id = ? AND job_id = ?",
+                (actual_cwd, workspace_id, job_id),
             )
+            db.execute(
+                "UPDATE job_operations SET actual_cwd = COALESCE(actual_cwd, ?) WHERE workspace_id = ? AND job_id = ?",
+                (actual_cwd, workspace_id, job_id),
+            )
+
+    def reopen_rejected_job_operation(
+        self, workspace_id: str, idempotency_key: str, *, origin_nonce: str | None = None,
+        launch_cwd: str | None = None, remote_state_dir: str | None = None,
+        ssh_target: str | None = None,
+    ) -> bool:
+        """Permit an explicit retry only after a tool confirmed no execution."""
+        self._validate_job_origin(origin_nonce, launch_cwd, remote_state_dir)
+        if ssh_target is not None and (not isinstance(ssh_target, str) or not ssh_target):
+            raise ValueError("ssh_target must be a non-empty string or None")
+        with self._transaction() as db:
+            endpoint_clause = "ssh_target IS NULL" if ssh_target is None else "ssh_target = ?"
+            endpoint_params = () if ssh_target is None else (ssh_target,)
+            cursor = db.execute(
+                """UPDATE job_operations SET state = 'reserved', origin_nonce = ?,
+                          launch_cwd = COALESCE(launch_cwd, ?),
+                          remote_state_dir = COALESCE(remote_state_dir, ?),
+                          ssh_target = COALESCE(ssh_target, ?),
+                          updated_at = CURRENT_TIMESTAMP
+                   WHERE workspace_id = ? AND idempotency_key = ? AND state = 'rejected' AND """ + endpoint_clause,
+                (origin_nonce, launch_cwd, remote_state_dir, ssh_target,
+                 workspace_id, idempotency_key, *endpoint_params),
+            )
+            if cursor.rowcount == 1:
+                row = db.execute(
+                    "SELECT job_id FROM job_operations WHERE workspace_id = ? AND idempotency_key = ?",
+                    (workspace_id, idempotency_key),
+                ).fetchone()
+                db.execute(
+                    """UPDATE jobs SET origin_nonce = ?, launch_cwd = COALESCE(launch_cwd, ?),
+                              remote_state_dir = COALESCE(remote_state_dir, ?),
+                              ssh_target = COALESCE(ssh_target, ?)
+                       WHERE workspace_id = ? AND job_id = ?""",
+                    (origin_nonce, launch_cwd, remote_state_dir, ssh_target,
+                     workspace_id, row["job_id"]),
+                )
             return cursor.rowcount == 1
 
     def record_call(self, workspace_id, tool, argument_bytes, result_bytes, duration_ms, failed, read_key=None):

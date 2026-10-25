@@ -597,7 +597,7 @@ async def test_switch_waits_for_foreground_call_across_router_instances(project)
     assert switched["host"] == "b"
 
 
-async def test_job_controls_and_local_reads_bypass_foreground_lease_and_keep_origin(project, monkeypatch):
+async def test_job_controls_fail_closed_without_saved_identity_and_local_reads_bypass_lease(project, monkeypatch):
     router, _, source, other = project
 
     # The production tool list is being extended independently; ensure this
@@ -637,6 +637,15 @@ async def test_job_controls_and_local_reads_bypass_foreground_lease_and_keep_ori
     origin_snapshot = router.snapshot(router.registry.get(workspace_id), origin_target)
     origin_executor = origin_snapshot.workspace.executor
     current_executor = router.snapshot(router.registry.get(workspace_id)).workspace.executor
+    routed_targets = []
+    original_snapshot = router.snapshot
+
+    def capture_snapshot(state, target=None):
+        if target is not None:
+            routed_targets.append(target)
+        return original_snapshot(state, target)
+
+    monkeypatch.setattr(router, "snapshot", capture_snapshot)
     entered, release = asyncio.Event(), asyncio.Event()
 
     async def blocked_run(*args, **kwargs):
@@ -644,7 +653,10 @@ async def test_job_controls_and_local_reads_bypass_foreground_lease_and_keep_ori
         await release.wait()
         return SSHResult(stdout="foreground complete", stderr="", exit_code=0)
 
+    cancel_calls = []
+
     async def cancel_job(job_id):
+        cancel_calls.append(job_id)
         return {"job_id": job_id, "cancel_requested": True, "origin_host": "host-a"}
 
     def local_job_info(executor):
@@ -677,12 +689,14 @@ async def test_job_controls_and_local_reads_bypass_foreground_lease_and_keep_ori
     completed = await asyncio.wait_for(foreground, 2)
 
     stopped, status, waited, listed, record, output, matches, info = controls
-    assert stopped["cancel_requested"] is True and stopped["origin_host"] == "host-a"
-    assert status["remote_task"]["origin_host"] == "host-a"
-    assert status["execution_state"] == "running"
-    assert waited["stdout_tail"] == "prefix searchable-marker suffix\n"
-    assert waited["remote_task"]["origin_host"] == "host-a"
-    assert waited["job_output_id"] == output_id
+    # A registry-only legacy job has no saved process identity. Session job
+    # controls must refuse it instead of trusting the currently configured
+    # endpoint or an incomplete local lookup.
+    for result in (stopped, status, waited):
+        assert result["execution_state"] == "unknown"
+        assert result["state_reason"]
+    assert cancel_calls == []
+    assert origin_target in routed_targets
     assert any(item.get("id") == output_id for item in listed["records"])
     assert record["tool"] == "fixture"
     assert output["content"] == "prefix searchable-marker suffix\n"
@@ -736,6 +750,43 @@ async def test_start_job_idempotency_key_recovers_handle_without_resubmitting(pr
                    idempotency_key="request-7")
     assert len(submissions) == 1
     assert router.registry.get_job(initial["workspace_id"], first["job_id"]).host == "a"
+
+
+async def test_unverified_start_actual_cwd_is_not_persisted(project, monkeypatch):
+    router, _, source, _ = project
+
+    async def inspect(host, cwd):
+        return {"cwd": str(Path(cwd).resolve()), "repository_root": None}
+
+    async def prepare(executor, source_cwd, target_id, destination):
+        return {"cwd": destination}
+
+    monkeypatch.setattr(router, "inspect_directory", inspect)
+    monkeypatch.setattr("remote_workbench.workspace_router.prepare_project", prepare)
+    server = create_server(router, viewer_url="http://127.0.0.1:9999")
+    state = await call(server, "a", "workspace_switch", host="a", cwd=str(source))
+
+    async def mismatched_identity(executor, payload, **kwargs):
+        return {
+            "job_id": payload["job_id"],
+            "job_dir": "/untrusted/state/jobs/" + payload["job_id"],
+            "actual_cwd": "/untrusted/physical/cwd",
+            "remote_task": {"actual_cwd": "/untrusted/physical/cwd",
+                            "origin_nonce": "0" * 32},
+            "execution_state": "unknown",
+            "error": "job_identity_unconfirmed",
+            "state_reason": "origin_nonce_mismatch",
+        }
+
+    monkeypatch.setattr(commands, "edit", mismatched_identity)
+    result = await call(server, "a", "start_job", command="printf no-confirmation",
+                        idempotency_key="unverified-cwd")
+    saved = router.registry.get_job_origin(state["workspace_id"], result["job_id"])
+    operation = router.registry.get_job_operation(state["workspace_id"], "unverified-cwd")
+
+    assert result["error"] == "job_identity_unconfirmed"
+    assert saved["actual_cwd"] is None
+    assert operation.actual_cwd is None
 
 
 async def test_rejected_compute_review_can_be_resubmitted_with_the_same_idempotency_key(project, monkeypatch):

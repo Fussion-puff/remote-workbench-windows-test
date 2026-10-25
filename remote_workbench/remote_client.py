@@ -24,6 +24,22 @@ async def request(executor, payload, cwd=None, timeout=None):
 async def edit(executor, payload, cwd=None, max_bytes=8192, timeout=None):
     if not 256 <= max_bytes <= 65536:
         raise ValueError("max_bytes must be between 256 and 65536")
+    origin = None
+    if payload.get("op") == "job_start":
+        from remote_workbench.job_collector import current_origin
+        origin = current_origin(executor, payload.get("job_id"))
+        if origin is not None:
+            from remote_workbench.job_collector import validate_origin
+            reason = validate_origin(executor, payload.get("job_id"), origin)
+            if reason:
+                return {"error": "job_identity_unconfirmed", "job_id": payload.get("job_id"),
+                        "execution_state": "unknown", "state_reason": reason}
+            nonce = origin.get("origin_nonce")
+            if not isinstance(nonce, str):
+                return {"error": "job_identity_unconfirmed", "job_id": payload.get("job_id"),
+                        "execution_state": "unknown", "state_reason": "origin_nonce_unavailable"}
+            payload["origin_nonce"] = nonce
+            payload["launch_cwd"] = origin["launch_cwd"]
     result = await request(executor, payload, cwd, timeout=timeout)
     if result.exit_code != 0:
         return {"error": "remote_failed", "message": result.stderr, "output_id": result.output_id,
@@ -59,7 +75,13 @@ async def edit(executor, payload, cwd=None, max_bytes=8192, timeout=None):
         value["diff"], value["diff_truncated"] = audit.preview(data, max_bytes)
     value["output_id"] = result.output_id
     if payload.get("op") == "job_start" and value.get("job_dir") and not value.get("error"):
-        local = await executor.track_job(value, payload["command"], cwd or executor.config.default_cwd)
+        local = await executor.track_job(value, payload["command"], cwd or executor.config.default_cwd,
+                                         origin=origin)
+        if isinstance(value.get("remote_task"), dict):
+            value["remote_task"] = {key: item for key, item in value["remote_task"].items()
+                                    if key != "origin_nonce"}
+        if local.get("error"):
+            return {**value, **local, "launch_output_id": result.output_id}
         value.update(local)
         value["launch_output_id"] = result.output_id
         value["output_id"] = value["job_output_id"]

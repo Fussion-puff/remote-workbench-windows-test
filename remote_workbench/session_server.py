@@ -17,7 +17,7 @@ from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.server.fastmcp.tools.base import Tool
 
-from remote_workbench import audit
+from remote_workbench import audit, job_collector
 from remote_workbench.audit_web import handler_for_workspaces
 from remote_workbench.config import load_config
 from remote_workbench.session_context import get_codex_identity, request_metadata, SessionIdentityUnavailable
@@ -50,6 +50,24 @@ _UNLOCKED_TOOLS = _LOCAL_TOOLS | _JOB_CONTROL_TOOLS | {
 } | _READ_ONLY_REMOTE_TOOLS | _SESSION_LOCAL_TOOLS
 _BUDGETS = {"exec_command": 2048, "read_file": 4096, "patch_file": 4096,
             "git_diff": 4096, "start_job": 8192}
+
+
+def _job_origin_record(target, job_id, *, origin_nonce, launch_cwd, remote_state_dir,
+                      ssh_target, actual_cwd=None):
+    return {
+        "workspace_id": target.workspace_id,
+        "job_id": job_id,
+        "target_id": target.target_id,
+        "host": target.host,
+        "source_cwd": target.source_cwd,
+        "target_cwd": target.cwd,
+        "project_root": target.project_root,
+        "origin_nonce": origin_nonce,
+        "launch_cwd": launch_cwd,
+        "remote_state_dir": remote_state_dir,
+        "ssh_target": ssh_target,
+        "actual_cwd": actual_cwd,
+    }
 
 
 def create_identity_probe(*, viewer_url: str | None = None, audit_dir: Path) -> FastMCP:
@@ -361,15 +379,31 @@ def create_server(router: SessionRouter, *, viewer_url: str | None = None,
             raise ValueError("idempotency_key must contain 1..128 ASCII letters, digits, '-' or '_'")
         operation = router.registry.get_job_operation(state.workspace_id, idempotency_key)
         local_job = None
-        local_job_error = False
-        if operation.target.host in router.config.hosts and operation.target.cwd:
+        local_job_error = None
+        if operation.target.host not in router.config.hosts:
+            local_job_error = "origin_host_not_configured"
+        elif not operation.target.cwd:
+            local_job_error = "origin_target_cwd_unavailable"
+        else:
             try:
                 executor = router.executor(operation.target.host, operation.target.cwd,
                                            operation.target.project_root)
-                lookup = getattr(executor, "job_local_info", None)
-                local_job = lookup(operation.job_id) if lookup is not None else None
-            except (OSError, ValueError, sqlite3.Error):
-                local_job_error = True
+                origin = _job_origin_record(
+                    operation.target, operation.job_id,
+                    origin_nonce=operation.origin_nonce,
+                    launch_cwd=operation.launch_cwd,
+                    remote_state_dir=operation.remote_state_dir,
+                    ssh_target=operation.ssh_target,
+                    actual_cwd=operation.actual_cwd,
+                )
+                local_job = await job_collector.ensure(executor, operation.job_id, origin=origin)
+                if (isinstance(local_job, dict) and local_job.get("job_output_id") and
+                        not local_job.get("error") and local_job.get("execution_state") != "unknown" and
+                        local_job.get("actual_cwd")):
+                    router.registry.update_job_actual_cwd(
+                        state.workspace_id, operation.job_id, local_job["actual_cwd"])
+            except (OSError, ValueError, sqlite3.Error, RuntimeError) as exc:
+                local_job_error = "origin_recovery_unavailable: " + str(exc)
         result = {
             "idempotency_key": operation.idempotency_key,
             "operation_state": operation.state,
@@ -379,12 +413,17 @@ def create_server(router: SessionRouter, *, viewer_url: str | None = None,
             "updated_at": operation.updated_at,
             "execution_state": (local_job.get("execution_state", "unknown")
                                  if isinstance(local_job, dict) else "unknown"),
-            "next_step": "Call job_status with this job_id; it is routed to the saved target.",
+            "next_step": "Use job_status or job_wait to inspect the same job; both route to its saved target.",
         }
         if isinstance(local_job, dict):
             result["local_job"] = local_job
-        elif local_job_error:
+            if local_job.get("error"):
+                result["local_job_state"] = "unavailable"
+                result["state_reason"] = (local_job.get("state_reason") or
+                                           local_job.get("sync_error") or local_job["error"])
+        if local_job_error:
             result["local_job_state"] = "unavailable"
+            result["state_reason"] = local_job_error
         if operation.state in {"reserved", "unknown"}:
             result["warning"] = (
                 "Submission may have reached the remote worker. Do not restart it under a new key "
@@ -547,7 +586,7 @@ def create_server(router: SessionRouter, *, viewer_url: str | None = None,
         ("workspace_history", history, "Read this thread's previous host/source-directory bindings, newest first."),
         ("workspace_resume", resume, "Build a local-only recovery summary of this thread's binding, last test, saved jobs and note; local cache freshness is unknown and no SSH query is made."),
         ("workspace_note", note, "Read or update this thread's small local recovery note (goal, constraints, decisions, next_step)."),
-        ("resolve_operation", resolve_operation, "Recover a background job handle by its idempotency_key after a lost response. This reads local state only; use job_status to inspect the job."),
+        ("resolve_operation", resolve_operation, "Recover the same background job by its idempotency_key after a lost response. This may make a read-only SSH status request to the saved origin, then reconnects local log collection; it never starts a second job."),
         ("workspace_snapshot", workspace_snapshot, "Inspect current remote Git state, last test evidence for this target, and measured response bytes. Last test evidence does not certify the current code."),
         ("workspace_changes", workspace_changes, "List files changed in this private session copy relative to its initial content baseline; no diff text is returned."),
         ("workspace_preview", workspace_preview, "Preview explicitly selected changed files against their original source with bounded unified diffs and apply guards."),
@@ -571,18 +610,37 @@ def create_server(router: SessionRouter, *, viewer_url: str | None = None,
             if _name in _LOCAL_TOOLS:
                 return await _function(**arguments)
             target = router.registry.get_job(state.workspace_id, arguments["job_id"]) if _name in _JOB_CONTROL_TOOLS else None
+            if target is not None and target.host not in router.config.hosts:
+                return {"job_id": arguments["job_id"], "error": "job_origin_unavailable",
+                        "running": None, "execution_state": "unknown",
+                        "state_reason": "origin_host_not_configured"}
             snapshot = router.snapshot(state, target)
+            job_origin = None
+            if _name in _JOB_CONTROL_TOOLS:
+                saved_origin = router.registry.get_job_origin(state.workspace_id, arguments["job_id"])
+                job_origin = _job_origin_record(
+                    saved_origin["target"], arguments["job_id"],
+                    origin_nonce=saved_origin["origin_nonce"],
+                    launch_cwd=saved_origin["launch_cwd"],
+                    remote_state_dir=saved_origin["remote_state_dir"],
+                    ssh_target=saved_origin["ssh_target"],
+                    actual_cwd=saved_origin["actual_cwd"],
+                )
             job_operation = None
             idempotency_key = arguments.pop("idempotency_key", None) if _name == "start_job" else None
             if _name == "start_job":
                 origin = WorkspaceTarget(snapshot.target_id, state.workspace_id, snapshot.host,
                                          snapshot.source_cwd, snapshot.cwd, snapshot.project_root)
+                launch_cwd = snapshot.workspace.resolve_cwd(arguments.get("cwd"))
+                remote_state_dir = snapshot.workspace.executor.remote_state_dir
+                ssh_target = snapshot.workspace.executor.config.ssh_target
+                candidate_nonce = uuid.uuid4().hex
                 if idempotency_key is not None:
                     if (not isinstance(idempotency_key, str) or
                             not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", idempotency_key)):
                         raise ValueError("idempotency_key must contain 1..128 ASCII letters, digits, '-' or '_'")
                     requested_job_id = arguments.get("job_id") or None
-                    effective_cwd = snapshot.workspace.resolve_cwd(arguments.get("cwd"))
+                    effective_cwd = launch_cwd
                     timeout = arguments.get("timeout")
                     if timeout is None:
                         timeout = snapshot.workspace.executor.config.job_timeout
@@ -598,11 +656,15 @@ def create_server(router: SessionRouter, *, viewer_url: str | None = None,
                     ).encode()).hexdigest()
                     job_id = requested_job_id or uuid.uuid4().hex
                     job_operation, created = router.registry.reserve_job_operation(
-                        state.workspace_id, idempotency_key, origin, job_id, fingerprint)
+                        state.workspace_id, idempotency_key, origin, job_id, fingerprint,
+                        origin_nonce=candidate_nonce, launch_cwd=launch_cwd,
+                        remote_state_dir=remote_state_dir, ssh_target=ssh_target)
                     if not created:
                         if job_operation.state == "rejected":
                             reopened = router.registry.reopen_rejected_job_operation(
-                                state.workspace_id, idempotency_key)
+                                state.workspace_id, idempotency_key,
+                                origin_nonce=candidate_nonce, launch_cwd=launch_cwd,
+                                remote_state_dir=remote_state_dir, ssh_target=ssh_target)
                             if reopened:
                                 job_operation = router.registry.get_job_operation(
                                     state.workspace_id, idempotency_key)
@@ -629,6 +691,14 @@ def create_server(router: SessionRouter, *, viewer_url: str | None = None,
                                 "message": "No new job was submitted. Use resolve_operation to recover this handle.",
                             }
                     arguments["job_id"] = job_operation.job_id
+                    job_origin = _job_origin_record(
+                        job_operation.target, job_operation.job_id,
+                        origin_nonce=job_operation.origin_nonce,
+                        launch_cwd=job_operation.launch_cwd,
+                        remote_state_dir=job_operation.remote_state_dir,
+                        ssh_target=job_operation.ssh_target,
+                        actual_cwd=job_operation.actual_cwd,
+                    )
                 else:
                     job_id = arguments.get("job_id") or uuid.uuid4().hex
                     if not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", job_id):
@@ -636,7 +706,14 @@ def create_server(router: SessionRouter, *, viewer_url: str | None = None,
                     arguments["job_id"] = job_id
                     # Even without a request key, reserve the immutable origin
                     # before submission so later job controls cannot drift.
-                    router.registry.register_job(state.workspace_id, job_id, origin)
+                    router.registry.register_job(
+                        state.workspace_id, job_id, origin,
+                        origin_nonce=candidate_nonce, launch_cwd=launch_cwd,
+                        remote_state_dir=remote_state_dir, ssh_target=ssh_target)
+                    job_origin = _job_origin_record(
+                        origin, job_id, origin_nonce=candidate_nonce,
+                        launch_cwd=launch_cwd, remote_state_dir=remote_state_dir,
+                        ssh_target=ssh_target)
             tool = bind_tool(snapshot.workspace, _name, _function, "")
             with audit.scoped_metadata(**snapshot.metadata(), client_session_id=identity.session_id):
                 if (_name in _EVIDENCE_INVALIDATING_TOOLS and
@@ -667,7 +744,8 @@ def create_server(router: SessionRouter, *, viewer_url: str | None = None,
                     try:
                         if evidence_record is not None:
                             evidence_before = await test_evidence.capture(snapshot)
-                        result = await tool(**arguments)
+                        with job_collector.scoped_origin(job_origin):
+                            result = await tool(**arguments)
                     except BaseException:
                         if job_operation is not None:
                             try:
@@ -708,6 +786,20 @@ def create_server(router: SessionRouter, *, viewer_url: str | None = None,
                 finally:
                     if evidence_token is not None:
                         audit.operation_id.reset(evidence_token)
+            if (job_origin is not None and isinstance(result, dict) and
+                    result.get("job_output_id") and not result.get("error") and
+                    result.get("execution_state") != "unknown"):
+                actual_cwd = result.get("actual_cwd")
+                remote_task = result.get("remote_task")
+                if not actual_cwd and isinstance(remote_task, dict):
+                    actual_cwd = remote_task.get("actual_cwd")
+                if actual_cwd:
+                    try:
+                        router.registry.update_job_actual_cwd(
+                            job_origin["workspace_id"], job_origin["job_id"], actual_cwd)
+                    except (ValueError, sqlite3.Error, OSError) as exc:
+                        result = dict(result, execution_state="unknown",
+                                      state_reason="actual_cwd_conflict", error=str(exc))
             if job_operation is not None:
                 if result.get("executed") is False:
                     operation_state = "rejected"
