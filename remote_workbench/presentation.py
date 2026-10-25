@@ -15,6 +15,7 @@ from typing import Any
 _STATE_LABELS = {
     "success": "成功",
     "failed": "失败",
+    "skipped": "已跳过",
     "running": "运行中",
     "timeout": "已超时",
     "checked": "检查通过",
@@ -78,6 +79,9 @@ _UNITTEST_SUMMARY = re.compile(
     r"(?:[ \t]*\r?\n)*[ \t]*(OK(?:\s+\([^\r\n)]*\))?|FAILED(?:\s+\([^\r\n)]*\))?)[ \t]*\r?\n?[ \t\r\n]*\Z"
 )
 _UNITTEST_FAILURE = re.compile(r"(?m)^(?:FAIL|ERROR):\s*(.+?)\s*$")
+_UNITTEST_COUNTER = re.compile(
+    r"(?P<name>failures|errors|skipped|expected failures|unexpected successes)=(?P<count>\d+)"
+)
 
 
 def _mapping(value: Any) -> dict:
@@ -283,6 +287,34 @@ def _contains_error(record: dict) -> bool:
     return bool(record.get("error")) or record.get("status") == "failed" or record.get("patch_result") == "failed"
 
 
+def _unittest_counters(footer: str, total: int) -> dict | None:
+    """Parse only unittest's known footer counters; unknown forms stay visible."""
+    open_paren = footer.find(" (")
+    if open_paren < 0:
+        return {}
+    if not footer.endswith(")"):
+        return None
+    raw = footer[open_paren + 2:-1]
+    if not raw:
+        return None
+    counters = {}
+    for item in raw.split(", "):
+        match = _UNITTEST_COUNTER.fullmatch(item)
+        if not match or match.group("name") in counters:
+            return None
+        counters[match.group("name")] = int(match.group("count"))
+
+    skipped = counters.get("skipped", 0)
+    expected_failures = counters.get("expected failures", 0)
+    if skipped > total or expected_failures > total or skipped + expected_failures > total:
+        return None
+    if footer.startswith("OK") and any(
+        counters.get(name, 0) for name in ("failures", "errors", "unexpected successes")
+    ):
+        return None
+    return counters
+
+
 def summarize_output(text: str, record: dict, stream: str, complete: bool = False) -> dict | None:
     """Summarize a complete Python ``unittest`` result when its ending is clear.
 
@@ -311,6 +343,13 @@ def summarize_output(text: str, record: dict, stream: str, complete: bool = Fals
     seconds = float(match.group(2))
     footer = match.group(3)
     reported_success = footer.startswith("OK")
+    counters = _unittest_counters(footer, count)
+    if counters is None or count == 0:
+        return None
+    skipped = counters.get("skipped", 0)
+    expected_failures = counters.get("expected failures", 0)
+    executed = count - skipped
+    passed = executed - expected_failures
     operation_failed = _contains_error(record) or exit_code not in (None, 0)
     if reported_success and exit_code is None and not _contains_error(record):
         return None
@@ -321,6 +360,19 @@ def summarize_output(text: str, record: dict, stream: str, complete: bool = Fals
             detail = f"报告耗时 {seconds:.3f} 秒；进程退出码 {exit_code}"
         else:
             detail = f"报告耗时 {seconds:.3f} 秒；操作状态为失败"
+    elif reported_success and skipped == count:
+        state = "skipped"
+        title = f"{count} 项测试全部跳过"
+        detail = f"耗时 {seconds:.3f} 秒"
+    elif reported_success and expected_failures:
+        state = "success"
+        skipped_detail = f"，跳过 {skipped} 项" if skipped else ""
+        title = f"测试完成（共 {count} 项{skipped_detail}，预期失败 {expected_failures} 项）"
+        detail = f"耗时 {seconds:.3f} 秒"
+    elif reported_success and skipped:
+        state = "success"
+        title = f"已执行 {passed} 项测试通过（共 {count} 项，跳过 {skipped} 项）"
+        detail = f"耗时 {seconds:.3f} 秒"
     elif reported_success:
         state = "success"
         title = f"{count} 项测试通过"
@@ -343,6 +395,20 @@ def summarize_output(text: str, record: dict, stream: str, complete: bool = Fals
     if failures:
         result["failures"] = failures[:20]
         result["failure_count"] = len(failures)
+    if any(counters.values()):
+        result.update({"total": count, "skipped": skipped, "executed": executed})
+        if expected_failures:
+            result["expected_failures"] = expected_failures
+        if counters.get("unexpected successes"):
+            result["unexpected_successes"] = counters["unexpected successes"]
+        if counters.get("failures"):
+            result["reported_failures"] = counters["failures"]
+        if counters.get("errors"):
+            result["reported_errors"] = counters["errors"]
+        # FAILED counters can include subtest failures, so they do not reveal
+        # how many top-level tests passed. Derive this only from an OK footer.
+        if reported_success and (skipped or expected_failures):
+            result["passed"] = passed
     return result
 
 

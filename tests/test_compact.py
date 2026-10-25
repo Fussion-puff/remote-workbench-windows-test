@@ -48,6 +48,79 @@ def test_large_success_uses_full_spool_but_keeps_unknown_output(tmp_path):
         assert "test_summary" not in compact_result("exec_command", original, {"command": "python3 -m unittest -v"})
 
 
+def test_skipped_unittest_counts_are_explicit_and_all_skipped_is_not_passed():
+    skipped = result(
+        stderr=("test_skipped (tests.Example) ... skipped 'missing optional environment'\n\n"
+                "----------------------------------------------------------------------\n"
+                "Ran 1 test in 0.001s\n\nOK (skipped=1)\n"),
+    )
+    value = compact_result("exec_command", skipped, {"command": "python3 -m unittest -v"})
+    assert value["test_summary"] == {
+        "status": "skipped", "tests": 0, "total": 1, "skipped": 1, "executed": 0,
+    }
+    assert "stderr" not in value
+    assert skipped["stderr"].startswith("test_skipped")
+
+    partial = result(stderr=("test_one (tests.Example) ... ok\n"
+                             "test_two (tests.Example) ... skipped 'not configured'\n\n"
+                             "----------------------------------------------------------------------\n"
+                             "Ran 2 tests in 0.002s\n\nOK (skipped=1)\n"))
+    value = compact_result("exec_command", partial, {"command": "python3 -m unittest -v"})
+    assert value["test_summary"] == {
+        "status": "passed", "tests": 1, "total": 2, "skipped": 1, "executed": 1,
+    }
+
+
+def test_nonverbose_skips_expected_failures_unknown_counters_and_failures():
+    command = {"command": "python3 -m unittest"}
+    nonverbose = result(stderr="s\nRan 1 test in 0.001s\n\nOK (skipped=1)\n")
+    assert compact_result("exec_command", nonverbose, command)["test_summary"] == {
+        "status": "skipped", "tests": 0, "total": 1, "skipped": 1, "executed": 0,
+    }
+
+    expected = result(stderr=("test_expected (tests.Example) ... expected failure\n\n"
+                              "----------------------------------------------------------------------\n"
+                              "Ran 1 test in 0.001s\n\nOK (expected failures=1)\n"))
+    assert compact_result("exec_command", expected, {"command": "python3 -m unittest -v"})["test_summary"] == {
+        "status": "completed", "tests": 0, "total": 1, "skipped": 0,
+        "executed": 1, "expected_failures": 1,
+    }
+
+    unexpected = result(stderr="Ran 1 test in 0.001s\n\nFAILED (unexpected successes=1)\n")
+    visible = compact_result("exec_command", unexpected, command)
+    assert "test_summary" not in visible and visible["stderr"] == unexpected["stderr"]
+
+    unknown = result(stderr="s\nRan 1 test in 0.001s\n\nOK (skipped=1, future counter=1)\n")
+    visible = compact_result("exec_command", unknown, command)
+    assert "test_summary" not in visible and visible["stderr"] == unknown["stderr"]
+
+    nonzero = result(exit_code=1, stderr="Ran 1 test in 0.001s\n\nOK (skipped=1)\n")
+    visible = compact_result("exec_command", nonzero, command)
+    assert "test_summary" not in visible and visible["stderr"] == nonzero["stderr"]
+
+    warning = result(stderr="warning: optional dependency unavailable\n" + nonverbose["stderr"])
+    visible = compact_result("exec_command", warning, command)
+    assert "test_summary" not in visible and visible["stderr"] == warning["stderr"]
+
+
+def test_truncated_skipped_result_uses_complete_unchanged_spool(tmp_path):
+    with audit.scoped_root(tmp_path):
+        output_id = audit.create(kind="command", status="finished")
+        path = audit.directory(output_id)
+        text = "s\nRan 1 test in 0.001s\n\nOK (skipped=1)\n"
+        (path / "stdout").write_text("")
+        (path / "stderr").write_text(text)
+        original = result(truncated=True, output_id=output_id, stderr="partial preview")
+        value = compact_result("exec_command", original, {"command": "python3 -m unittest"})
+        assert value["test_summary"]["status"] == "skipped"
+        assert (path / "stderr").read_text() == text
+
+        # An incomplete or unavailable spool keeps the preview and its warning.
+        original["output_id"] = "not-an-output-id"
+        visible = compact_result("exec_command", original, {"command": "python3 -m unittest"})
+        assert "test_summary" not in visible and visible["stderr"] == "partial preview"
+
+
 def test_cleanup_uncertainty_ids_and_error_diagnostics_survive():
     task = {"state": "finished", "reason": "finished", "cleanup_state": "unconfirmed", "tree_confirmed": False,
             "pgid": 123, "node": "node1", "message": "cleanup unavailable"}

@@ -67,7 +67,7 @@ def _test_summary(result, command):
         if not text.strip():
             continue
         summary = summarize_output(text, result, stream, complete=True)
-        if not summary or summary["state"] != "success":
+        if not summary or summary["state"] not in {"success", "skipped"}:
             return None
         # Keep warnings, prints, fixture diagnostics and arbitrary wrapper output.
         # A recognized footer alone does not justify hiding everything before it.
@@ -80,7 +80,22 @@ def _test_summary(result, command):
         summaries.append(summary)
     if len(summaries) != 1:
         return None
-    return {"status": "passed", "tests": summaries[0]["count"]}
+    summary = summaries[0]
+    if summary["state"] == "skipped":
+        return {"status": "skipped", "tests": 0, "total": summary["total"],
+                "skipped": summary["skipped"], "executed": summary["executed"]}
+    if summary.get("skipped") or summary.get("expected_failures"):
+        value = {
+            "status": "completed" if summary.get("expected_failures") else "passed",
+            "tests": summary.get("passed", summary["count"]),
+            "total": summary["total"],
+            "skipped": summary["skipped"],
+            "executed": summary["executed"],
+        }
+        if summary.get("expected_failures"):
+            value["expected_failures"] = summary["expected_failures"]
+        return value
+    return {"status": "passed", "tests": summary["count"]}
 
 
 def compact_result(name, result, arguments=None):
