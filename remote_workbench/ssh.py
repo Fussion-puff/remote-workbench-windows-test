@@ -341,7 +341,10 @@ class SSHExecutor:
                     data += source.read(first)
                 else:
                     data = source.read(cap)
-            text, cut = audit.preview(data, max(0, cap), self.config.max_output_lines)
+            # An explicit byte budget must not silently keep the legacy 200-line
+            # ceiling: a complete small diff can exceed that many short lines.
+            line_limit = self.config.max_output_lines if output_budget is None else None
+            text, cut = audit.preview(data, max(0, cap), line_limit)
             contents[stream] = text
             truncated |= cut or sizes[stream] > cap
         transport_failed = exit_code == 255 and _is_ssh_error(contents["stderr"])

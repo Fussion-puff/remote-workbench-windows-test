@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.0a11 (develop)
+
+- Add an opt-in compact session tool profile, on-demand advanced schemas, reusable workspace audit links and conservative successful-test summaries.
+- Combine explicit workspace selection and its first inspection without another model round.
+- Accept context patches without model-calculated hunk counts; keep standard unified diffs in the human audit viewer.
+- Honor explicit command-output byte budgets without the legacy 200-line ceiling; preserve byte caps, complete local spools, and the default line cap when no byte budget is supplied.
+- Add a complete-task token budget gate with the user's maximum 2% extra usage; the latest valid nine-vs-nine sample is +4.613% and does not qualify.
+
 ## 0.3.0a10
 
 - Always include filenames in remote grep matches, including a single input file on GNU grep; preserve the same result format across Linux and macOS.

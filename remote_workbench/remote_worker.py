@@ -132,6 +132,12 @@ def apply_patch(request):
     repo = Path(os.fsdecode(top.stdout).strip())
     os.chdir(repo)
     with lock(repo / ".remote-workbench-patch"):
+        native = request["patch"].startswith("*** Begin Patch")
+        if native:
+            patch = compile_native_patch(request["patch"], repo, request.get("max_file_size", 10485760)).encode("utf-8")
+            if not patch:
+                return {"success": True, "check_only": bool(request.get("check_only")),
+                        "summary": "", "patch_sha256": sha(patch), "normalized_patch": ""}
         # Refuse paths outside the worktree using git's default path protections.
         check = subprocess.run(["git", "apply", "--check", "--whitespace=nowarn", "-"], input=patch, capture_output=True)
         if check.returncode:
@@ -141,7 +147,10 @@ def apply_patch(request):
             result = subprocess.run(["git", "apply", "--whitespace=nowarn", "-"], input=patch, capture_output=True)
             if result.returncode:
                 return {"error": "apply_failed", "message": result.stderr.decode("utf-8", "replace")}
-        return {"success": True, "check_only": bool(request.get("check_only")), "summary": summary.stdout.decode("utf-8", "replace"), "patch_sha256": sha(patch)}
+        result = {"success": True, "check_only": bool(request.get("check_only")), "summary": summary.stdout.decode("utf-8", "replace"), "patch_sha256": sha(patch)}
+        if native:
+            result["normalized_patch"] = patch.decode("utf-8")
+        return result
 
 
 def read_binary(request):

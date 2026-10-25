@@ -8,6 +8,7 @@ from remote_workbench.remote_shell import python_command
 _SUPERVISOR_SOURCE = (Path(__file__).with_name("remote_shell.py").read_text() + "\n" +
                       Path(__file__).with_name("remote_task.py").read_text())
 SOURCE = ("TASK_SUPERVISOR_SOURCE = " + repr(_SUPERVISOR_SOURCE) + "\nexec(TASK_SUPERVISOR_SOURCE)\n" +
+          "exec(" + repr(Path(__file__).with_name("native_patch.py").read_text()) + ")\n" +
           Path(__file__).with_name("remote_worker.py").read_text())
 
 
@@ -43,8 +44,9 @@ async def edit(executor, payload, cwd=None, max_bytes=8192, timeout=None):
     if payload.get("op") == "apply_patch":
         # The human viewer can display the submitted patch directly from disk;
         # don't echo an already supplied patch back through the model channel.
+        display_patch = value.pop("normalized_patch", payload["patch"])
         with audit.open_stream(result.output_id, "diff") as output:
-            output.write(payload["patch"].encode("utf-8"))
+            output.write(display_patch.encode("utf-8"))
         audit.update(result.output_id, diff_kind="submitted_patch",
                      check_only=bool(payload.get("check_only")),
                      patch_result="failed" if value.get("error") else "checked" if payload.get("check_only") else "applied")

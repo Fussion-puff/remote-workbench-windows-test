@@ -1,5 +1,14 @@
 # Validation status
 
+## Compact task workflow (0.3.0a11 develop candidate)
+
+- Full local regression after the explicit-byte-budget fix: 477 tests passed (99.35 seconds). The later inclusive 2% gate passed its 10 targeted checks. Wheel/sdist builds passed; this develop candidate has not been promoted to main or the independent stable installation.
+- Opt-in session profile: eight exposed tools; advanced operations retain their original validation and routing behind an on-demand gateway. The full profile remains the default.
+- Both local and real IHEP disposable private copies passed the same 21-case acceptance and 18 project tests across eight scripted tool steps. The context patch was checked/applied once; full command output and normalized Git diffs remain in the local audit viewer. These are functional replays, not independent model usage measurements.
+- Successful test replies in this replay shrank from 1183 to 373 UTF-8 bytes after removing repeated normal metadata. Bytes are not tokens or subscription usage.
+- The current complete-task ceiling is **2% extra**, inclusive, with original functionality preserved. A fresh actual nine-vs-nine pair on the loaded candidate used 355,677 native vs 372,086 remote tokens (+4.613%); both passed the same 21-case independent acceptance, but the usage gate remains **not qualified**. Original 1% historical reports are retained. The checker rejects different baseline/task hashes, models/settings, request counts, failed acceptance and incomplete/retry-excluded totals.
+- Independent stable remains 0.3.0a10. A local project-only override selects the develop candidate without changing global MCP registration or other projects.
+
 ## Stable source promotion and GNU grep (0.3.0a10)
 
 - Full local regression suite: 437 tests passed (95.82 seconds).

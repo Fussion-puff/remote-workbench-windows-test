@@ -15,6 +15,7 @@ import uuid
 
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
+from mcp.server.fastmcp.tools.base import Tool
 
 from remote_workbench import audit
 from remote_workbench.audit_web import handler_for_workspaces
@@ -28,6 +29,7 @@ from remote_workbench.workspace_snapshot import collect as collect_snapshot
 from remote_workbench.compute_review import REVIEW_INSTRUCTIONS, check_compute_review
 from remote_workbench import baseline, test_evidence
 from remote_workbench.auth_boundary import authentication_command
+from remote_workbench.compact import COMPACT_INSTRUCTIONS, COMPACT_TOOLS, compact_result
 
 _LOCAL_TOOLS = {"audit_list", "audit_get", "read_output", "search_output"}
 _JOB_CONTROL_TOOLS = {"job_status", "stop_job", "job_wait"}
@@ -73,8 +75,15 @@ def create_identity_probe(*, viewer_url: str | None = None, audit_dir: Path) -> 
     return server
 
 
-def create_server(router: SessionRouter, *, viewer_url: str | None = None) -> FastMCP:
-    server = FastMCP("remote-workbench-session", instructions=(
+def create_server(router: SessionRouter, *, viewer_url: str | None = None,
+                  tool_profile: str = "full") -> FastMCP:
+    if tool_profile not in {"full", "compact"}:
+        raise ValueError("tool_profile must be full or compact")
+    handlers = {}
+    schemas = {}
+    executors = {}
+    linked_workspaces = set()
+    server = FastMCP("remote-workbench-session", instructions=COMPACT_INSTRUCTIONS if tool_profile == "compact" else (
         "Codex's native local tools always remain available and are never redirected by this MCP. "
         "Use this MCP only for operations the user explicitly assigns to a remote host in the current chat. "
         "Selecting a remote workspace affects only Remote Workbench tools, not all project commands. "
@@ -102,17 +111,25 @@ def create_server(router: SessionRouter, *, viewer_url: str | None = None) -> Fa
     def workspace_url(state):
         return f"{viewer_url}/w/{state.workspace_id}/" if viewer_url else None
 
-    def pack(result, state):
+    def pack(result, state, name=None, arguments=None):
         result = dict(result)
-        result.setdefault("workspace_id", state.workspace_id)
-        result.setdefault("revision", state.revision)
+        if tool_profile == "compact":
+            result = compact_result(name, result, arguments)
+        else:
+            result.setdefault("workspace_id", state.workspace_id)
+            result.setdefault("revision", state.revision)
         url = workspace_url(state)
-        if url:
+        needs_link = (tool_profile != "compact" or state.workspace_id not in linked_workspaces
+                      or name in {"workspace_info", "workspace_switch", "workspace_use_local", "workspace_resume"}
+                      or result.get("error") or result.get("initial_error") or result.get("timed_out")
+                      or result.get("exit_code") not in (None, 0))
+        if url and needs_link:
             record_id = result.get("operation_id") or result.get("output_id") or result.get("id")
             if (isinstance(record_id, str) and re.fullmatch(r"[a-f0-9]{32}", record_id)
-                    and (audit.directory(record_id) / "record.json").is_file()):
+                    and tool_profile != "compact" and (audit.directory(record_id) / "record.json").is_file()):
                 url += "?id=" + record_id
             result["operation_log"] = f"[**Remote Workbench 操作记录**]({url})"
+            linked_workspaces.add(state.workspace_id)
         return json.dumps(result, ensure_ascii=False, separators=(",", ":"), default=str)
 
     async def info(state, identity, **arguments):
@@ -389,7 +406,9 @@ def create_server(router: SessionRouter, *, viewer_url: str | None = None) -> Fa
             # into an apparent tool failure that invites a dangerous retry.
             print("Remote Workbench communication accounting unavailable", file=sys.stderr)
 
-    async def switch(state, identity, host: str, cwd: str, expected_revision: int | None = None):
+    async def switch(state, identity, host: str, cwd: str, expected_revision: int | None = None,
+                     command: str | None = None, max_bytes: int = 4096,
+                     timeout: int | None = None, compute_review: dict | None = None):
         record = audit.create(kind="tool", tool="workspace_switch", status="running",
                               arguments={"host": host, "cwd": cwd, "expected_revision": expected_revision})
         token = audit.operation_id.set(record)
@@ -397,9 +416,20 @@ def create_server(router: SessionRouter, *, viewer_url: str | None = None) -> Fa
             updated = await router.switch(state, host, cwd, expected_revision)
             audit.update(record, status="finished", host=updated.host, cwd=updated.cwd,
                          target_id=updated.target_id, revision=updated.revision, previous=asdict(state))
-            return dict(asdict(updated), bound=True, project_isolated=True,
-                        previous={"host": state.host, "cwd": state.cwd, "revision": state.revision},
-                        operation_id=record)
+            result = dict(asdict(updated), bound=True, project_isolated=True,
+                          previous={"host": state.host, "cwd": state.cwd, "revision": state.revision},
+                          operation_id=record)
+            if command is not None:
+                # The switch already owns the lease. Execute against its committed
+                # target directly, without a nested lease or a new model round.
+                try:
+                    result["initial"] = await executors["exec_command"](
+                        updated, identity, command=command, cwd=".", timeout=timeout,
+                        max_bytes=max_bytes, compute_review=compute_review)
+                except Exception as exc:
+                    # Binding succeeded; never misreport it as a failed switch.
+                    result["initial_error"] = str(exc)
+            return result
         except BaseException as exc:
             audit.update(record, status="failed", error=str(exc))
             raise
@@ -424,6 +454,7 @@ def create_server(router: SessionRouter, *, viewer_url: str | None = None) -> Fa
             audit.operation_id.reset(token)
 
     def register(name, signature, description, execute):
+        executors[name] = execute
         # Context is injected by FastMCP and deliberately absent from JSON Schema.
         signature = signature.replace(parameters=[*signature.parameters.values(),
             inspect.Parameter("ctx", inspect.Parameter.KEYWORD_ONLY, annotation=Context, default=None)],
@@ -449,9 +480,12 @@ def create_server(router: SessionRouter, *, viewer_url: str | None = None) -> Fa
                                     client_session_id=identity.session_id)
                     with audit.scoped_root(directory), audit.scoped_metadata(**metadata):
                         result = await execute(current, identity, **arguments)
-                        text = pack(result, router.registry.get(current.workspace_id))
-                        failed = bool(result.get("error") or result.get("timed_out") or
-                                      result.get("exit_code") not in (None, 0))
+                        text = pack(result, router.registry.get(current.workspace_id), name, arguments)
+                        initial = result.get("initial", {})
+                        failed = bool(result.get("error") or result.get("initial_error") or result.get("timed_out") or
+                                      result.get("exit_code") not in (None, 0) or
+                                      initial.get("error") or initial.get("timed_out") or
+                                      initial.get("exit_code") not in (None, 0))
                         record_metrics(current, name, arguments, text, started, result=result, failed=failed)
                         return text
 
@@ -476,7 +510,10 @@ def create_server(router: SessionRouter, *, viewer_url: str | None = None) -> Fa
         invoke.__signature__ = signature
         invoke.__annotations__ = {p.name: p.annotation for p in signature.parameters.values()}
         invoke.__annotations__["return"] = str
-        server.tool(structured_output=False)(invoke)
+        handlers[name] = invoke
+        schemas[name] = Tool.from_function(invoke, structured_output=False)
+        if tool_profile == "full" or name in COMPACT_TOOLS:
+            server.tool(structured_output=False)(invoke)
 
     for name, function, description in (
         ("workspace_info", info, "Inspect this thread's persistent workspace and metadata identity. No remote execution."),
@@ -488,7 +525,7 @@ def create_server(router: SessionRouter, *, viewer_url: str | None = None) -> Fa
         ("workspace_changes", workspace_changes, "List files changed in this private session copy relative to its initial content baseline; no diff text is returned."),
         ("workspace_preview", workspace_preview, "Preview explicitly selected changed files against their original source with bounded unified diffs and apply guards."),
         ("workspace_apply", workspace_apply, "Apply selected, reviewed workspace_preview file entries back to the original source with per-file hash guards."),
-        ("workspace_switch", switch, "Validate a configured host/source cwd, create or resume a private project copy, then atomically switch. Old jobs keep their original target."),
+        ("workspace_switch", switch, "Select an explicitly requested host/source cwd and create/resume this chat's private copy. Optional command runs its initial inspection in the same call. Old jobs keep their original target."),
         ("workspace_use_local", use_local, "Clear this thread's active remote binding and return to native local tools. Remote targets, private copies, history, and job origins remain available."),
     ):
         signature = inspect.signature(function, eval_str=True)
@@ -659,6 +696,28 @@ def create_server(router: SessionRouter, *, viewer_url: str | None = None) -> Fa
             return result
 
         register(name, public, description, execute)
+    if tool_profile == "compact":
+        @server.tool(structured_output=False)
+        async def workspace_tools(tool: str, arguments: dict | None = None, ctx: Context = None) -> str:
+            """Advanced tools by name: jobs, recovery, notes, delivery, search/edits. tool='describe', arguments={name:'start_job'} returns just that schema; omit name for available names. Normal tasks use exec_command/apply_patch directly."""
+            identity = get_codex_identity(ctx)
+            if arguments is not None and not isinstance(arguments, dict):
+                raise ToolError("arguments must be an object")
+            arguments = arguments or {}
+            if tool == "describe":
+                name = arguments.get("name")
+                if name is None:
+                    result = {"tools": sorted(handlers)}
+                elif name in schemas:
+                    selected = schemas[name]
+                    result = {"name": name, "description": selected.description, "inputSchema": selected.parameters}
+                else:
+                    raise ToolError("Unknown tool name")
+                state = router.registry.get_or_create(identity.thread_id)
+                return pack(result, state)
+            if tool not in handlers or "ctx" in arguments:
+                raise ToolError("Unknown tool or invalid arguments")
+            return await schemas[tool].run(arguments, context=ctx)
     return server
 
 
@@ -668,6 +727,8 @@ def main():
     parser.add_argument("--data-dir", type=Path, default=default_state_dir(), help="Private local registry/audit directory")
     parser.add_argument("--viewer-port", type=int, default=0, help="Local viewer port (default 0: OS-assigned); falls back if occupied")
     parser.add_argument("--identity-probe", action="store_true", help="Expose only a local metadata diagnostic, without host configuration or remote tools")
+    parser.add_argument("--tool-profile", choices=("full", "compact"), default="full",
+                        help="compact exposes eight tools and retains advanced tools behind workspace_tools")
     args = parser.parse_args()
     if args.identity_probe:
         directory = args.data_dir.expanduser().resolve() / "identity-probe"
@@ -679,7 +740,7 @@ def main():
     with _local_audit_viewer(args.viewer_port, handler=handler_for_workspaces(router.state_dir / "audit")) as viewer:
         url = viewer.viewer_url
         print(f"Local session audit viewer: {url}", file=sys.stderr, flush=True)
-        create_server(router, viewer_url=url).run()
+        create_server(router, viewer_url=url, tool_profile=args.tool_profile).run()
 
 
 if __name__ == "__main__":
