@@ -664,18 +664,18 @@ def main():
     parser = argparse.ArgumentParser(description="Local, persistent Codex thread-aware remote workspace MCP (prototype)")
     parser.add_argument("--config", help="Host allowlist YAML; uses the normal Remote Workbench configuration by default")
     parser.add_argument("--data-dir", type=Path, default=default_state_dir(), help="Private local registry/audit directory")
-    parser.add_argument("--viewer-port", type=int, default=8769, help="Preferred localhost viewer port; falls back if occupied")
+    parser.add_argument("--viewer-port", type=int, default=0, help="Local viewer port (default 0: OS-assigned); falls back if occupied")
     parser.add_argument("--identity-probe", action="store_true", help="Expose only a local metadata diagnostic, without host configuration or remote tools")
     args = parser.parse_args()
     if args.identity_probe:
         directory = args.data_dir.expanduser().resolve() / "identity-probe"
         with _local_audit_viewer(args.viewer_port, audit_dir=directory) as viewer:
-            url = f"http://127.0.0.1:{viewer.server_port}"
+            url = viewer.viewer_url
             create_identity_probe(viewer_url=url, audit_dir=directory).run()
         return
     router = SessionRouter(load_config(args.config), args.data_dir)
     with _local_audit_viewer(args.viewer_port, handler=handler_for_workspaces(router.state_dir / "audit")) as viewer:
-        url = f"http://127.0.0.1:{viewer.server_port}"
+        url = viewer.viewer_url
         print(f"Local session audit viewer: {url}", file=sys.stderr, flush=True)
         create_server(router, viewer_url=url).run()
 

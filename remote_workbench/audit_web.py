@@ -1,9 +1,12 @@
 """Read-only localhost audit viewer; does not start SSH or an agent."""
 import argparse
+import errno
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
+import re
+import uuid
 
 from remote_workbench import audit
 from remote_workbench.presentation import summarize_record, summarize_output, parse_unified_diff
@@ -40,6 +43,7 @@ main{display:grid;grid-template-columns:minmax(250px,310px) minmax(0,1fr);height
 <details class="raw-details" id="raw-details"><summary>查看原始完整输出</summary><div class="subtle" style="font-size:12px;margin:6px 0">原始文本会按需分段读取，滚动区域保留完整换行和空格。</div><pre class="output raw-output" id="raw-output"></pre><div class="actions"><button class="button" id="raw-next" type="button">读取下一段</button><small id="raw-meta"></small></div></details></div></article></section></main>
 <script>
 (() => {
+  const VIEWER_ID = null;
   const STREAMS = ['stdout','stderr','diff','stdin','startup_stdout','startup_stderr'];
   const LABELS = {stdout:'输出',stderr:'运行日志',diff:'代码改动',stdin:'输入',startup_stdout:'启动信息',startup_stderr:'启动诊断'};
   const TOOL_TITLES = {ssh_run:'运行命令',ssh_run_background:'启动后台任务',ssh_job_status:'查看后台任务',ssh_read_file:'读取文件',ssh_write_file:'修改文件',ssh_patch_file:'修改文件',ssh_append_file:'追加文件内容',ssh_insert_lines:'插入文件内容',ssh_replace_lines:'替换文件行',ssh_list_dir:'查看目录',ssh_file_info:'查看文件信息',ssh_mkdir:'创建目录',ssh_move:'移动文件',ssh_delete:'删除文件',ssh_download:'下载文件',ssh_grep:'搜索代码',ssh_find_files:'查找文件',ssh_git_status:'查看版本状态',ssh_git_diff:'查看代码改动',ssh_git_log:'查看提交记录',ssh_apply_patch:'应用代码补丁',ssh_check_connection:'检查连接'};
@@ -48,8 +52,20 @@ main{display:grid;grid-template-columns:minmax(250px,310px) minmax(0,1fr);height
   let latestRecordId = '', streamPinned = false, outputPlaceholder = false, ready = false;
   const buttons = new Map();
   async function get(url) {
-    const workspacePrefix = location.pathname.match(/^\/w\/[a-f0-9]{32}(?=\/)/);
-    const response = await fetch((workspacePrefix ? workspacePrefix[0] : '') + url, {cache:'no-store'});
+    let requestPrefix = '';
+    if (VIEWER_ID !== null) {
+      const instancePrefix = '/v/' + VIEWER_ID;
+      if (location.pathname !== instancePrefix && !location.pathname.startsWith(instancePrefix + '/'))
+        throw Error('此操作记录页面已失效或来自其他项目，请重新打开当前项目提供的链接。');
+      const workspacePrefix = location.pathname.match(new RegExp('^' + instancePrefix + '/w/[a-f0-9]{32}(?=/)'));
+      requestPrefix = instancePrefix + (workspacePrefix ? workspacePrefix[0].slice(instancePrefix.length) : '');
+    } else {
+      const workspacePrefix = location.pathname.match(/^\/w\/[a-f0-9]{32}(?=\/)/);
+      requestPrefix = workspacePrefix ? workspacePrefix[0] : '';
+    }
+    const response = await fetch(requestPrefix + url, {cache:'no-store'});
+    if (VIEWER_ID !== null && (!response.headers || response.headers.get('X-Remote-Workbench-Viewer') !== VIEWER_ID))
+      throw Error('此操作记录页面已失效或来自其他项目，请重新打开当前项目提供的链接。');
     let value;
     try { value = await response.json(); } catch (_) { throw Error('HTTP ' + response.status); }
     if (!response.ok) throw Error(value.error || ('HTTP ' + response.status));
@@ -490,7 +506,13 @@ class Handler(BaseHTTPRequestHandler):
         value = lambda key, default="": query.get(key, [default])[0]
         try:
             if url.path == "/":
-                self._send(HTML.encode(), "text/html; charset=utf-8", 200)
+                viewer_id = getattr(self, "viewer_instance_id", None)
+                page = HTML.replace(
+                    "const VIEWER_ID = null;",
+                    f"const VIEWER_ID = {json.dumps(viewer_id)};",
+                    1,
+                )
+                self._send(page.encode(), "text/html; charset=utf-8", 200)
                 return
             if url.path == "/api/records":
                 result = self._recent_views(self._integer(value("limit", "100"), "limit"))
@@ -613,6 +635,9 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Content-Security-Policy", "default-src 'none'; connect-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'")
+        viewer_id = getattr(self, "viewer_instance_id", None)
+        if viewer_id is not None:
+            self.send_header("X-Remote-Workbench-Viewer", viewer_id)
         self.end_headers()
         self.wfile.write(body)
 
@@ -648,12 +673,47 @@ def handler_for_workspaces(path):
     return WorkspaceHandler
 
 
+def handler_for_instance(base_handler, instance_id):
+    """Require a per-server URL prefix so stale links cannot reach a new viewer."""
+    if not isinstance(instance_id, str) or re.fullmatch(r"[a-f0-9]{32}", instance_id) is None:
+        raise ValueError("viewer instance ID must be 32 lowercase hexadecimal characters")
+
+    prefix = f"/v/{instance_id}"
+
+    class InstanceHandler(base_handler):
+        viewer_instance_id = instance_id
+
+        def do_GET(self):
+            url = urlparse(self.path)
+            if url.path == prefix:
+                scoped_path = "/"
+            elif url.path.startswith(prefix + "/"):
+                scoped_path = url.path[len(prefix):]
+            else:
+                self._send_json({"error": "This viewer link is no longer valid"}, 404)
+                return
+            self.path = scoped_path + ("?" + url.query if url.query else "")
+            super().do_GET()
+
+    return InstanceHandler
+
+
 def main():
     parser = argparse.ArgumentParser(description="Remote Workbench local audit viewer")
-    parser.add_argument("--port", type=int, default=8766)
+    parser.add_argument("--port", type=int, default=0,
+                        help="Local viewer port (default 0: OS-assigned); falls back if occupied")
     args = parser.parse_args()
-    server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
-    print(f"操作记录：http://127.0.0.1:{server.server_port} 目录：{audit.root()}", flush=True)
+    if not 0 <= args.port <= 65535:
+        parser.error("port must be between 0 and 65535")
+    instance_id = uuid.uuid4().hex
+    handler = handler_for_instance(Handler, instance_id)
+    try:
+        server = ThreadingHTTPServer(("127.0.0.1", args.port), handler)
+    except OSError as exc:
+        if exc.errno != errno.EADDRINUSE:
+            raise
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    print(f"操作记录：http://127.0.0.1:{server.server_port}/v/{instance_id}/ 目录：{audit.root()}", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

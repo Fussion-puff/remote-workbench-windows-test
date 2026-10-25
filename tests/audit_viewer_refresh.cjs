@@ -41,7 +41,9 @@ class Element {
 }
 
 const A = 'a'.repeat(32), B = 'b'.repeat(32), C = 'c'.repeat(32);
-const prefix = '/w/' + 'd'.repeat(32);
+const viewerId = process.argv[3] || '';
+const responseViewer = process.argv[4] || '';
+const prefix = (viewerId ? '/v/' + viewerId : '') + '/w/' + 'd'.repeat(32);
 const clone = value => JSON.parse(JSON.stringify(value));
 const flush = () => new Promise(resolve => setImmediate(resolve));
 
@@ -51,7 +53,7 @@ async function boot({running = false, empty = false, checked = false, output = '
     if (!elements.has(id)) elements.set(id, new Element(id));
     return elements.get(id);
   };
-  const state = {rows: [], records: new Map(), streams: new Map(), requests: [], failList: false};
+  const state = {rows: [], records: new Map(), streams: new Map(), requests: [], failList: false, jsonCalls: 0};
   function add(id, text, status = 'finished') {
     const record = {id, tool: 'exec_command', status, exit_code: status === 'finished' ? 0 : null,
       created_at: state.records.size + 1, arguments: {command: 'command-' + id[0]},
@@ -62,6 +64,7 @@ async function boot({running = false, empty = false, checked = false, output = '
   }
   if (!empty) add(A, output, running ? 'running' : 'finished');
   const location = {href: 'http://127.0.0.1:8767' + prefix + '/' + (empty ? '' : '?id=' + A), pathname: prefix + '/'};
+  el('operation').hidden = true;
   el('live').checked = checked; el('follow-latest').checked = true;
   let serial = 0;
   const sandbox = {console, URL, Intl, Map, Set, Date,
@@ -97,7 +100,10 @@ async function boot({running = false, empty = false, checked = false, output = '
           total_bytes: bytes.length, truncated: next < bytes.length};
         if (state.afterOutput) {const hook = state.afterOutput; state.afterOutput = null; hook();}
       }
-      return {ok: status === 200, status, json: async () => value};
+      return {ok: status === 200, status,
+        headers: {get: name => name.toLowerCase() === 'x-remote-workbench-viewer'
+          ? (responseViewer === '-' ? null : responseViewer || viewerId || null) : null},
+        json: async () => {state.jsonCalls++; return value;}};
     }};
   vm.runInNewContext(fs.readFileSync(0, 'utf8'), sandbox);
   await flush();
@@ -173,6 +179,19 @@ async function run(name) {
     f.add(B, 'recovered\n'); await f.tick();
     assert.match(f.el('refresh-status').textContent, /失败/);
     await f.tick(); assert.equal(f.el('output').textContent, 'recovered\n');
+  } else if (name === 'viewer_valid') {
+    f = await boot();
+    assert.equal(f.el('operation').hidden, false, 'the matching viewer instance can render its record');
+    assert.equal(f.el('output').textContent, 'first\n');
+    assert.ok(f.state.requests.every(url => url.startsWith(prefix + '/api/')),
+      'all API requests retain both viewer and workspace prefixes');
+  } else if (name === 'viewer_foreign' || name === 'viewer_missing') {
+    f = await boot();
+    assert.equal(f.state.jsonCalls, 0, 'a foreign or missing viewer identity is rejected before parsing response data');
+    assert.equal(f.el('operation').hidden, true, 'foreign records are never rendered');
+    assert.match(f.el('message').textContent, /页面已失效或来自其他项目/);
+    assert.ok(f.state.requests.every(url => url.startsWith(prefix + '/api/')),
+      'even a stale page requests only its original viewer/workspace prefix');
   } else throw Error('Unknown case: ' + name);
   assert.ok(f.state.requests.every(url => url.startsWith(prefix + '/api/')), 'workspace scope is preserved');
 }

@@ -1,5 +1,13 @@
 # Validation status
 
+## Viewer instance isolation (0.3.0a7)
+
+- Full local regression suite: 410 tests passed (92.89 seconds). Targeted viewer/session checks also passed: 40 tests (6.34 seconds).
+- Coverage includes OS-assigned loopback ports, a foreign local HTML service holding the preferred port, simultaneous viewers, port reuse with stale URLs, instance response headers, workspace-scoped routes, and browser auto-refresh identity checks.
+- Actual develop launcher acceptance over MCP stdio and loopback HTTP passed: two MCP processes, three local chats, separate audit records, valid instance links, and stale/cross-chat record rejection. SSH invocation count: zero.
+- Tests use loopback HTTP and simulated SSH. Codex App integration and real IHEP/CERN SSH execution are separate acceptance steps; neither is implied by these results.
+- Implementation and handoff state: [Develop 交接记录](docs/develop-handoff.zh-CN.md).
+
 ## Develop task lifecycle and compute review (0.3.0a5) — 2026-10-24
 
 - Final local regression suite: 316 tests passed (121.95 seconds), using simulated SSH and bounded local processes.

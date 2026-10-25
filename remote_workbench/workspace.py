@@ -13,6 +13,7 @@ from pathlib import Path
 import posixpath
 import re
 import sys
+import uuid
 from threading import Thread
 from typing import Any
 
@@ -21,7 +22,7 @@ from mcp.server.fastmcp.exceptions import ToolError
 
 from remote_workbench import audit
 from remote_workbench.config import load_config
-from remote_workbench.audit_web import Handler as AuditViewerHandler, handler_for_directory
+from remote_workbench.audit_web import Handler as AuditViewerHandler, handler_for_directory, handler_for_instance
 from remote_workbench.server import workspace_executor
 from remote_workbench.ssh import SSHExecutor
 from remote_workbench.compute_review import REVIEW_INSTRUCTIONS
@@ -271,10 +272,12 @@ def _local_audit_viewer(port: int | None, *, audit_dir=None, handler=None):
     if port is None:
         yield None
         return
-    if isinstance(port, bool) or not 1 <= port <= 65535:
-        raise ValueError("viewer port must be between 1 and 65535")
+    if isinstance(port, bool) or not 0 <= port <= 65535:
+        raise ValueError("viewer port must be between 0 and 65535")
 
     handler = handler or (handler_for_directory(audit_dir) if audit_dir is not None else AuditViewerHandler)
+    instance_id = uuid.uuid4().hex
+    handler = handler_for_instance(handler, instance_id)
     try:
         viewer = ThreadingHTTPServer(("127.0.0.1", port), handler)
     except OSError as exc:
@@ -285,6 +288,7 @@ def _local_audit_viewer(port: int | None, *, audit_dir=None, handler=None):
         viewer = ThreadingHTTPServer(("127.0.0.1", 0), handler)
         print(f"Audit viewer port {port} is in use; using {viewer.server_port}.",
               file=sys.stderr, flush=True)
+    viewer.viewer_url = f"http://127.0.0.1:{viewer.server_port}/v/{instance_id}"
     thread = Thread(
         target=viewer.serve_forever,
         kwargs={"poll_interval": 0.1},
@@ -309,8 +313,8 @@ def _local_audit_viewer(port: int | None, *, audit_dir=None, handler=None):
 def main():
     parser = argparse.ArgumentParser(description="Local Remote Workbench MCP bound to one remote workspace")
     parser.add_argument("--workspace", required=True, help="Local workspace JSON manifest")
-    parser.add_argument("--viewer-port", type=int, default=8768,
-                        help="Preferred local audit viewer port (default 8768); if occupied, use an available port")
+    parser.add_argument("--viewer-port", type=int, default=0,
+                        help="Local viewer port (default 0: OS-assigned); if occupied, use an available port")
     args = parser.parse_args()
     workspace = Workspace.load(args.workspace)
     from remote_workbench.workspace_session import WorkspaceSession
@@ -318,7 +322,7 @@ def main():
     with _local_audit_viewer(args.viewer_port, audit_dir=session.audit_dir) as viewer:
         viewer_url = None
         if viewer is not None:
-            viewer_url = f"http://127.0.0.1:{viewer.server_port}"
+            viewer_url = viewer.viewer_url + "/"
             print(f"Local audit viewer: {viewer_url}", file=sys.stderr, flush=True)
         create_server(workspace, viewer_url=viewer_url, session=session).run()
 

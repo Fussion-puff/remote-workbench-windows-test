@@ -36,11 +36,11 @@ Git 副本先从仓库 `HEAD` 独立 clone，并以该 commit 建立副本自己
 ```json
 {
   "session_id": "<session_uuid>",
-  "operation_log": "[**Remote Workbench 操作记录**](http://127.0.0.1:<port>/?id=<operation_id>)"
+  "operation_log": "[**Remote Workbench 操作记录**](http://127.0.0.1:<port>/v/<viewer_id>/?id=<operation_id>)"
 }
 ```
 
-若调用以 MCP `ToolError` 失败，结果保留 `isError` 标记，并在错误文本中附上操作记录链接；这类错误不一定以 JSON 字段返回 `session_id` 或 `operation_log`。`operation_log` 会打开本 session 的本机查看页，并定位到对应操作或该 session 的操作列表。查看页展示实际远端命令、输出和 diff；完整记录留在本机，不需要经 MCP 再传给模型。每个 session 有独立的本机审计/输出目录和 viewer。MCP 使用 `--viewer-port` 指定首选端口；端口冲突时可自动改用另一个空闲端口，所以应使用工具结果里的链接或实际 `viewer_url`，不要把 `127.0.0.1:8768` 写死。
+若调用以 MCP `ToolError` 失败，结果保留 `isError` 标记，并在错误文本中附上操作记录链接；这类错误不一定以 JSON 字段返回 `session_id` 或 `operation_log`。`operation_log` 会打开本 session 的本机查看页，并定位到对应操作或该 session 的操作列表。查看页展示实际远端命令、输出和 diff；完整记录留在本机，不需要经 MCP 再传给模型。每个 session 有独立的本机审计/输出目录和 viewer。查看页默认由操作系统分配 loopback 端口，并使用本次服务实例的随机 URL 前缀；显式指定 `--viewer-port` 时如果首选端口被占用，会另选空闲端口，不会复用或终止占用它的 HTML 服务。页面自动刷新会核对服务实例身份。使用工具结果里的完整链接或当前 `viewer_url`；MCP 重启后重新打开新链接，旧链接不保证继续有效。
 
 MCP server instructions 要求 agent 在使用工具后的回复中附上该链接，并保留显示标题 **Remote Workbench 操作记录**。正常 JSON 工具响应提供 session ID 和链接，MCP `ToolError` 文本提供链接；因此无需为了获取操作记录而额外调用 `workspace_info`。这是 MCP 返回数据和指令定义的默认协作方式；服务器不能强制模型一定按要求组织最终回复，也不会把普通 MCP 操作转换为 Codex 原生终端或文件改动卡片。查看器服务随 MCP 进程运行，进程退出后本机记录和输出仍保留。
 

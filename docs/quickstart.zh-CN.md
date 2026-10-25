@@ -44,8 +44,7 @@ hosts:
 command = "/absolute/local/path/remote-workbench/.venv/bin/remote-workbench-session"
 args = [
   "--config", "/absolute/local/path/.config/remote-workbench/config.yaml",
-  "--data-dir", "/absolute/local/path/remote-workbench-state",
-  "--viewer-port", "8768"
+  "--data-dir", "/absolute/local/path/remote-workbench-state"
 ]
 enabled = true
 ```
@@ -82,6 +81,6 @@ uv run remote-workbench establish dev --config ~/.config/remote-workbench/config
 
 ## 6. 查看命令、输出与 diff
 
-工具返回加粗的 **Remote Workbench 操作记录** 链接；打开它查看完整命令、输出和改动。实际端口以返回链接为准。后台日志由本地采集器保存，`job_wait` 等待增量，`search_output` 定位错误；完整记录保留在本地，模型按需读取有限片段。
+工具返回加粗的 **Remote Workbench 操作记录** 链接；打开它查看完整命令、输出和改动。查看页默认使用系统分配的本机端口及本次进程专属地址，因此可与其他项目的 HTML 服务并行。若手动指定的首选端口正被占用，Remote Workbench 会另选空闲端口，不会接管已有页面。MCP 重启后请用新工具结果中的链接；旧链接会失效。后台日志由本地采集器保存，`job_wait` 等待增量，`search_output` 定位错误；完整记录保留在本地，模型按需读取有限片段。
 
 同一 threadId 可在进程重启后恢复绑定；新聊天独立。记录与工程副本是工作流隔离，不是操作系统权限沙箱。合并 MCP 条目不会删除旧日志、旧安装或远端副本。

@@ -2,7 +2,7 @@
 # Replace both absolute paths after cloning and copying workspace.example.json.
 [mcp_servers.remote-workbench-workspace]
 command = "/absolute/path/to/remote-workbench/.venv/bin/remote-workbench-workspace"
-args = ["--workspace", "/absolute/path/to/workspace.json", "--viewer-port", "8768"]
+args = ["--workspace", "/absolute/path/to/workspace.json"]
 env = { REMOTE_WORKBENCH_AUDIT_DIR = "/absolute/path/to/remote-workbench/.remote-workbench-audit" }
 
 # For the multi-host MCP instead, configure remote-workbench-ssh and select a host

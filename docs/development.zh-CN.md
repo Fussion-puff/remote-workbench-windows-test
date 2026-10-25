@@ -28,7 +28,7 @@ uv sync --locked --extra dev
 
 浏览器脚本的行为回归使用本机 Node.js 内置 VM，不需要安装 npm 依赖；本机缺少 Node 时 pytest 会跳过这组检查，CI 会先确认 Node 可用。Node 仅用于开发测试，运行 MCP 和远端执行仍使用原有 Python 环境。
 
-开发版使用独立的主机配置、workspace manifest 和审计根目录。manifest 的 `config` 字段要显式指向开发版配置；`cwd` 指向远端模板目录，工具首次调用时会在模板旁创建该进程 session 专用副本，测试不会直接修改模板。稳定版和开发版可分别绑定日常与测试模板。MCP 开发项使用 `--viewer-port 8769`，并设 `enabled = false`，需要测试时再临时启用。每次启动进程都会得到新的 session UUID，进程内的本机审计、输出和查看页各自独立。
+开发版使用独立的主机配置、workspace manifest 和审计根目录。manifest 的 `config` 字段要显式指向开发版配置；`cwd` 指向远端模板目录，工具首次调用时会在模板旁创建该进程 session 专用副本，测试不会直接修改模板。稳定版和开发版可分别绑定日常与测试模板。测试时使用唯一 MCP 条目临时换成 develop 启动器；不需要固定查看器端口。每次启动进程都会得到新的 session UUID，进程内的本机审计、输出和查看页各自独立。
 
 ## 稳定版安装
 
@@ -71,13 +71,13 @@ args = []
 enabled = true
 ```
 
-启动器应固定 stable release 的 Python/入口，并明确传入 stable 的 `--config`、`--data-dir` 和查看器端口。新聊天默认本地；`workspace_info` 仅读本地身份和状态。需要远端时才选择主机及源目录，本地命令始终使用原生工具。
+启动器应固定 stable release 的 Python/入口，并明确传入 stable 的 `--config` 和 `--data-dir`。查看器默认使用 OS 分配的端口。新聊天默认本地；`workspace_info` 仅读本地身份和状态。需要远端时才选择主机及源目录，本地命令始终使用原生工具。
 
-开发测试也使用同一个 MCP 名称：临时将这一个条目的 command 改为 develop session 启动器，测试结束后改回 stable。两个启动器各自使用独立状态和查看器端口，不额外增加 `remote-workbench-develop` 或项目级重复条目。日常新聊天不会因 develop 源码更新而切换版本。
+开发测试也使用同一个 MCP 名称：临时将这一个条目的 command 改为 develop session 启动器，测试结束后改回 stable。两个安装渠道各自使用独立状态；进程启动时由系统分配互不冲突的查看器端口，并使用不同的随机页面前缀。不额外增加 `remote-workbench-develop` 或项目级重复条目。日常新聊天不会因 develop 源码更新而切换版本。
 
 身份诊断通常由 `workspace_info` 提供的 `identity_source`、`client_session_id`、`mode` 和工作区 ID完成。缺少 threadId 时会明确拒绝路由。需要检查原始 metadata 键时，可在隔离的命令行测试中使用 `--identity-probe`；它不作为另一个常驻 MCP 注册。
 
-每次工具结果提供 **Remote Workbench 操作记录** 链接；查看器端口冲突时以返回地址为准。stable/develop 的日志和状态保留在各自目录；合并配置条目不合并不同聊天的数据，也不删除旧副本或 release。
+每次工具结果提供 **Remote Workbench 操作记录** 链接，内含当前实际地址。查看页不会接入占用首选端口的其他项目 HTML 服务；自动刷新也会验证实例身份。MCP 重启后需通过新的工具结果打开查看页，旧链接会过期。stable/develop 的日志和状态保留在各自目录；合并配置条目不合并不同聊天的数据，也不删除旧副本或 release。
 
 切换渠道或更新单一条目的启动器后，重载客户端 MCP。旧工具列表可能继续缓存，需确认当前条目是 `remote-workbench` 并包含 `workspace_use_local`。回滚时把同一条目的启动器改回保留的旧 release，不新增第二个 MCP。
 
@@ -100,8 +100,12 @@ Develop 的 `0.3.0a1` 增加了 `remote-workbench-session`。它使用请求 met
 ```toml
 [mcp_servers.remote-workbench]
 command = "/absolute/path/to/stable/releases/VERSION-COMMIT/venv/bin/remote-workbench-session"
-args = ["--config", "/absolute/path/to/stable/hosts.yaml", "--data-dir", "/absolute/path/to/stable/session-data", "--viewer-port", "8768"]
+args = ["--config", "/absolute/path/to/stable/hosts.yaml", "--data-dir", "/absolute/path/to/stable/session-data"]
 enabled = true
 ```
 
 `hosts.yaml` 提供可选主机，不设置自动绑定的模板；`--data-dir` 与 develop 分开。旧固定 workspace 的进程 UUID 没有可信 threadId 映射，因此旧副本和记录保留，但不会静默转成新聊天的默认远端绑定。缺少 threadId 时新入口拒绝远端路由，不能回退到固定默认服务器。更换启动器后重载 App 的 MCP，再在新聊天验证 `workspace_info.mode=local`。
+
+查看页默认通过 `--viewer-port 0` 请求 OS 分配空闲端口。每个进程的页面地址带有独立随机前缀；即使端口后来被其他本地项目复用，旧页面和自动刷新也不能读取新实例的审计数据。需要固定首选端口时可以显式设置，但占用时会自动改用空闲端口。
+
+`0.3.0a7` 的查看页隔离实现与交接状态见[Develop 交接记录](develop-handoff.zh-CN.md)。

@@ -1,6 +1,6 @@
 # 按 Codex 对话路由的 Session 原型
 
-`remote-workbench-session` 从 `0.3.0a1` 起作为 develop 的可选入口，当前版本为 `0.3.0a6`。它复用原有 SSH、文件、Git 和后台任务工具，保留 `remote-workbench-workspace` 与 `remote-workbench-ssh`。安装到独立 wheel 环境的日常版不会随开发源码改变。
+`remote-workbench-session` 从 `0.3.0a1` 起作为 develop 的可选入口，当前目标版本为 `0.3.0a7`。它复用原有 SSH、文件、Git 和后台任务工具，保留 `remote-workbench-workspace` 与 `remote-workbench-ssh`。安装到独立 wheel 环境的日常版不会随开发源码改变。
 
 `0.3.0a5` 增加前后台任务的独立监督、进程组清理、`stop_job` 和独立清理命令。大量计算由 Agent 展示命令、并发规模和环境，等待用户明确确认后启动；普通工程操作直接执行，不要求 cgroup 或统一进程数上限。适用范围与实际清理边界见[计算审核与任务生命周期](process-safety.zh-CN.md)。本轮仅进行了本地受控测试，尚未做集群验收，也未替换 stable。
 
@@ -87,8 +87,7 @@ MCP 结果为一份紧凑 JSON 文本，不重复发送 structuredContent。命�
 uv sync --locked --extra dev
 uv run --locked remote-workbench-session \
   --config /absolute/path/to/develop/hosts.yaml \
-  --data-dir /absolute/path/to/develop/session-data \
-  --viewer-port 8770
+  --data-dir /absolute/path/to/develop/session-data
 ```
 
 MCP 客户端配置示例，路径需替换为本机展开后的绝对路径：
@@ -97,12 +96,14 @@ MCP 客户端配置示例，路径需替换为本机展开后的绝对路径：
 [mcp_servers.remote-workbench]
 enabled = false
 command = "/absolute/path/to/develop/.venv/bin/remote-workbench-session"
-args = ["--config", "/absolute/path/to/develop/hosts.yaml", "--data-dir", "/absolute/path/to/develop/session-data", "--viewer-port", "8770"]
+args = ["--config", "/absolute/path/to/develop/hosts.yaml", "--data-dir", "/absolute/path/to/develop/session-data"]
 ```
 
 只保留一个 `remote-workbench` 注册项。联调时替换同一条目的启动命令，而不是在全局和项目配置中同时增加 develop 条目；测试完成后改回固定 stable 启动器。也可仅在指定项目配置该唯一条目，并确保全局没有另一组重复注册。包含个人绝对路径的配置应排除出 Git；更换渠道后重载客户端工具。
 
 原型不改变客户端的进程管理。客户端可以让不同聊天启动不同 stdio 进程，也可以向同一个进程发送多个 threadId；两种情况均按同一个 SQLite Registry 路由。仅使用 stdio 配置不能保证 App 自动共享一个 MCP 进程。本阶段没有新增常驻 HTTP MCP 服务。
+
+查看页使用系统分配的本机端口和进程专属随机路径，避免与其他项目同时提供的 HTML 页面冲突。MCP 返回的操作记录链接始终包含该实例的完整地址；重载或重启 MCP 后，使用新工具结果中的链接。旧标签页和旧链接会因实例路径不匹配而返回未找到，不会显示后来复用同一端口的其他会话内容。
 
 ## 客户端联调边界
 

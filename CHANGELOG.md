@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.0a7 (develop)
+
+- Assign each local audit viewer an OS-selected loopback port by default and a random per-process URL prefix, so other project pages are not reused or overwritten.
+- Keep operation links pointed at the actual viewer instance; reject stale URLs and prevent auto-refresh from rendering responses from another instance.
+- Preserve per-session audit data and workspace routing under the instance-prefixed viewer URL.
+
 ## 0.3.0a5 (develop) — 2026-10-24
 
 - Supervise foreground commands and detached jobs with owned process groups, remote deadlines, foreground heartbeats, and TERM-to-KILL cleanup.

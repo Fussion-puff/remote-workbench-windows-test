@@ -1,7 +1,9 @@
 import errno
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
-import socket
+from threading import Thread
 from unittest.mock import AsyncMock, MagicMock, patch
+from urllib.error import HTTPError
 from urllib.request import urlopen
 
 from mcp.types import CallToolResult, TextContent
@@ -20,6 +22,13 @@ def decode_content(blocks):
 
 def wire_size(result):
     return len(result.model_dump_json(by_alias=True, exclude_none=True).encode("utf-8"))
+
+
+def viewer_handler(server_factory):
+    handler = server_factory.call_args_list[0].args[1]
+    assert issubclass(handler, workspace_module.AuditViewerHandler)
+    assert len(handler.viewer_instance_id) == 32
+    return handler
 
 
 async def test_workspace_result_is_single_compact_payload_and_output_is_pageable(local):
@@ -108,7 +117,9 @@ def test_local_audit_viewer_is_optional_loopback_and_closes_on_exit():
         with pytest.raises(RuntimeError, match="leave MCP"):
             with workspace_module._local_audit_viewer(8767) as active:
                 assert active is viewer
-                server_factory.assert_called_once_with(("127.0.0.1", 8767), workspace_module.AuditViewerHandler)
+                handler = viewer_handler(server_factory)
+                server_factory.assert_called_once_with(("127.0.0.1", 8767), handler)
+                assert active.viewer_url == f"http://127.0.0.1:8767/v/{handler.viewer_instance_id}"
                 thread_factory.assert_called_once_with(
                     target=viewer.serve_forever,
                     kwargs={"poll_interval": 0.1},
@@ -133,9 +144,10 @@ def test_local_audit_viewer_falls_back_only_when_requested_port_is_occupied():
         with workspace_module._local_audit_viewer(8768) as active:
             assert active is viewer
 
+    handler = viewer_handler(server_factory)
     assert [call.args for call in server_factory.call_args_list] == [
-        (("127.0.0.1", 8768), workspace_module.AuditViewerHandler),
-        (("127.0.0.1", 0), workspace_module.AuditViewerHandler),
+        (("127.0.0.1", 8768), handler),
+        (("127.0.0.1", 0), handler),
     ]
     thread_factory.assert_called_once_with(
         target=viewer.serve_forever,
@@ -162,7 +174,7 @@ def test_local_audit_viewer_preserves_unrelated_bind_errors(error_number):
                 pytest.fail("viewer must not start when bind fails")
 
     assert caught.value is bind_error
-    server_factory.assert_called_once_with(("127.0.0.1", 8768), workspace_module.AuditViewerHandler)
+    server_factory.assert_called_once_with(("127.0.0.1", 8768), viewer_handler(server_factory))
     thread_factory.assert_not_called()
 
 
@@ -179,40 +191,83 @@ def test_local_audit_viewer_preserves_fallback_bind_error():
                 pytest.fail("viewer must not start when the fallback bind fails")
 
     assert caught.value is fallback_error
+    handler = viewer_handler(server_factory)
     assert [call.args for call in server_factory.call_args_list] == [
-        (("127.0.0.1", 8768), workspace_module.AuditViewerHandler),
-        (("127.0.0.1", 0), workspace_module.AuditViewerHandler),
+        (("127.0.0.1", 8768), handler),
+        (("127.0.0.1", 0), handler),
     ]
     thread_factory.assert_not_called()
 
 
 def test_local_audit_viewer_uses_separate_live_listener_when_port_is_occupied():
-    # Release an OS-selected loopback port, then let the first managed viewer
-    # claim it. If another process wins that tiny race, its own fallback port
-    # becomes the port deliberately occupied by the second managed viewer.
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as reservation:
-        reservation.bind(("127.0.0.1", 0))
-        requested_port = reservation.getsockname()[1]
-
-    def assert_serving(port):
-        with urlopen(f"http://127.0.0.1:{port}/", timeout=2) as response:
+    def assert_serving(viewer):
+        with urlopen(viewer.viewer_url + "/", timeout=2) as response:
             assert response.status == 200
             assert b"Remote Workbench" in response.read(4096)
+            assert response.headers["X-Remote-Workbench-Viewer"] == viewer.RequestHandlerClass.viewer_instance_id
 
-    with workspace_module._local_audit_viewer(requested_port) as first:
+    with workspace_module._local_audit_viewer(0) as first:
         occupied_port = first.server_port
-        assert_serving(occupied_port)
+        assert occupied_port > 0
+        assert_serving(first)
 
         with workspace_module._local_audit_viewer(occupied_port) as second:
             assert second.server_port != occupied_port
-            assert_serving(occupied_port)
-            assert_serving(second.server_port)
+            assert first.RequestHandlerClass.viewer_instance_id != second.RequestHandlerClass.viewer_instance_id
+            assert_serving(first)
+            assert_serving(second)
 
         assert second.fileno() == -1
         assert first.fileno() >= 0
-        assert_serving(occupied_port)
+        assert_serving(first)
 
     assert first.fileno() == -1
+
+
+def test_viewer_does_not_reuse_or_interrupt_another_projects_html():
+    class OtherProject(BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = b"another project's HTML"
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    other = ThreadingHTTPServer(("127.0.0.1", 0), OtherProject)
+    thread = Thread(target=other.serve_forever, kwargs={"poll_interval": 0.1}, daemon=True)
+    thread.start()
+    try:
+        other_url = f"http://127.0.0.1:{other.server_port}/"
+        with workspace_module._local_audit_viewer(other.server_port) as viewer:
+            assert viewer.server_port != other.server_port
+            with urlopen(other_url, timeout=2) as response:
+                assert response.read() == b"another project's HTML"
+            with urlopen(viewer.viewer_url + "/", timeout=2) as response:
+                assert b"Remote Workbench" in response.read()
+        with urlopen(other_url, timeout=2) as response:
+            assert response.read() == b"another project's HTML"
+    finally:
+        other.shutdown()
+        other.server_close()
+        thread.join()
+
+
+def test_old_viewer_url_is_rejected_when_a_new_project_reuses_its_port(tmp_path):
+    with workspace_module._local_audit_viewer(0, audit_dir=tmp_path / "old") as previous:
+        port = previous.server_port
+        old_url = previous.viewer_url
+    with workspace_module._local_audit_viewer(port, audit_dir=tmp_path / "new") as current:
+        assert current.server_port == port
+        assert current.viewer_url != old_url
+        for suffix in ("/", "/api/records"):
+            with pytest.raises(HTTPError) as caught:
+                urlopen(old_url + suffix, timeout=2)
+            assert caught.value.code == 404
+        with urlopen(current.viewer_url + "/api/records", timeout=2) as response:
+            assert json.load(response) == []
 
 
 async def test_workspace_info_includes_only_the_viewer_url_for_its_mcp(local):
@@ -230,7 +285,7 @@ async def test_workspace_info_includes_only_the_viewer_url_for_its_mcp(local):
     assert "viewer_url" not in response
 
 
-@pytest.mark.parametrize("port", [0, -1, 65536, True])
+@pytest.mark.parametrize("port", [-1, 65536, True])
 def test_local_audit_viewer_rejects_invalid_port(port):
     with patch.object(workspace_module, "ThreadingHTTPServer") as server_factory:
         with pytest.raises(ValueError, match="viewer port"):
