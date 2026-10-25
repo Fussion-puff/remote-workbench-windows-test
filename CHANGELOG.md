@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.0a12 (develop)
+
+- Advance contextless saved-log search pages without repeating the same match; preserve overlapping matches and byte budgets.
+- Preserve unittest skipped/executed counts and expected failures; avoid deriving passing-test counts from failed subtest summaries.
+- Treat workspace recovery results as historical observations. Invalidate current test applicability on possible writes and re-associate matching code only through a fresh bounded snapshot, without claiming environment verification.
+- Add an offline cost ledger with explicit rate snapshots, stable request deduplication, separate actual/estimated amounts, and visible unknown coverage. This does not establish a full-task fee saving or replace the 2% token gate.
+- Document direct/copy migration and resource-coordination contracts; these modes and locks are not implemented by this release.
+
 ## 0.3.0a11 (develop)
 
 - Add an opt-in compact session tool profile, on-demand advanced schemas, reusable workspace audit links and conservative successful-test summaries.

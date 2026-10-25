@@ -1,5 +1,12 @@
 # Validation status
 
+## First implementation batch (0.3.0a12 develop)
+
+- Five bounded child-agent tasks delivered C1 log pagination, D1 skipped-test summaries, D2 evidence freshness, E1 an offline cost ledger, and the A1/A2 design contract. Parent review requested corrections before integration; direct/copy modes and cross-chat resource locks remain design-only.
+- Integrated local regression: 515 tests passed (108.68 seconds), using local fixtures and simulated SSH. No real server or credential was accessed in this batch. Original cursor/skip probes no longer reproduce; the copy symlink and repeat-delivery probes still reproduce and remain F1/F2 work.
+- Both real worker-usage files replay as 18 requests / 727,763 total tokens without double-counting cumulative usage, cache, or reasoning. Missing speed/rate/debit information remains unknown; supplied-record completeness does not certify full task or account costs.
+- Wheel/sdist builds passed. The independent stable remains 0.3.0a10; no new paid model comparison, remote failure injection, default-directory change, or stable promotion was performed.
+
 ## Compact task workflow (0.3.0a11 develop candidate)
 
 - Full local regression after the explicit-byte-budget fix: 477 tests passed (99.35 seconds). The later inclusive 2% gate passed its 10 targeted checks. Wheel/sdist builds passed; this develop candidate has not been promoted to main or the independent stable installation.

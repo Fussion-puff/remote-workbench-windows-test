@@ -10,6 +10,8 @@ This is an independently maintained derivative of [Onirika](https://github.com/x
 
 Develop 提供精简工具模式与完整任务 Token 预算检查；当前额外用量上限为 2%，最新真实配对样本为 4.613%，尚未达标。功能完整性是前提，见[任务用量预算](docs/token-budget.zh-CN.md)。
 
+第一批可靠性修复、离线费用账本及后续目录模式设计见[开发任务与执行状态](docs/development-plan.zh-CN.md)和[direct/copy 契约](docs/workspace-mode-contract.zh-CN.md)。费用脚本为 `python3 scripts/build_cost_ledger.py --help`；费率或速度缺失时保留未知，不当作实际零费用。
+
 The `main` branch holds the validated stable source; `develop` receives changes first. Promote a fixed commit only after develop CI passes, then check main CI before updating the independent local stable installation.
 
 The `remote-workbench-session` entry point (0.3.0a10) provides: persistent workspaces routed by MCP `_meta.threadId`, atomic host/directory switching, jobs pinned to their original targets and checked against node/process identity, explicit project snapshots, and measured response bytes. Each thread keeps its own remote project copies. An identity-only diagnostic is available before enabling remote tools. This does not change an independently installed stable release; see [Session 原型与客户端联调边界](docs/session-prototype.zh-CN.md).
