@@ -38,12 +38,14 @@ COMPACT_INSTRUCTIONS = (
     "Inspect unclear fan-out. Ordinary small tests/file operations need no extra confirmation."
 )
 
-_PROGRESS = re.compile(r"(?:test\S* .* \.\.\. (?:ok|skipped .+|expected failure)|[.sx]+)")
+_PROGRESS = re.compile(
+    r"(?:\s*test\S* .* \.\.\.(?:[ \t]+(?:ok|skipped .+|expected failure|unexpected success))?[ \t]*|"
+    r"UNEXPECTED SUCCESS: .+|[.sx]+)"
+)
 
 
 def _test_summary(result, command):
-    if (not is_test_command(command) or result.get("exit_code") != 0
-            or result.get("error") or result.get("timed_out")
+    if (not is_test_command(command) or result.get("error") or result.get("timed_out")
             or result.get("execution_state") != "finished"):
         return None
     output_id = result.get("output_id", "")
@@ -67,35 +69,37 @@ def _test_summary(result, command):
         if not text.strip():
             continue
         summary = summarize_output(text, result, stream, complete=True)
-        if not summary or summary["state"] not in {"success", "skipped"}:
+        if not summary or summary["state"] not in {"success", "completed", "failed"}:
             return None
         # Keep warnings, prints, fixture diagnostics and arbitrary wrapper output.
         # A recognized footer alone does not justify hiding everything before it.
         for line in text.splitlines():
             if (line.strip() and not _PROGRESS.fullmatch(line)
-                    and not re.fullmatch(r"-+", line)
+                    and not re.fullmatch(r"[-=]+", line)
                     and not re.fullmatch(r"Ran \d+ tests? in [0-9.]+s", line)
-                    and not re.fullmatch(r"OK(?: \(skipped=\d+,? ?expected failures=\d+\)| \([^\r\n]*\))?", line)):
+                    and not re.fullmatch(r"(?:OK|FAILED)(?: \([^\r\n]*\))?", line)):
                 return None
         summaries.append(summary)
     if len(summaries) != 1:
         return None
     summary = summaries[0]
-    if summary["state"] == "skipped":
-        return {"status": "skipped", "tests": 0, "total": summary["total"],
-                "skipped": summary["skipped"], "executed": summary["executed"]}
-    if summary.get("skipped") or summary.get("expected_failures"):
-        value = {
-            "status": "completed" if summary.get("expected_failures") else "passed",
-            "tests": summary.get("passed", summary["count"]),
-            "total": summary["total"],
-            "skipped": summary["skipped"],
-            "executed": summary["executed"],
-        }
-        if summary.get("expected_failures"):
-            value["expected_failures"] = summary["expected_failures"]
-        return value
-    return {"status": "passed", "tests": summary["count"]}
+    value = {
+        "status": "passed" if summary["state"] == "success" else summary["state"],
+        "tests": summary["passed"],
+        "tests_run": summary["tests_run"],
+        "reported_skips": summary["reported_skips"],
+        "executed": summary["executed"],
+        "passed": summary["passed"],
+        "report_status": summary["report_status"],
+        "process_status": summary["process_status"],
+        # These aliases remain useful to existing model-facing consumers.
+        "total": summary["tests_run"],
+        "skipped": summary["reported_skips"],
+    }
+    for key in ("expected_failures", "unexpected_successes", "reported_failures", "reported_errors"):
+        if key in summary:
+            value[key] = summary[key]
+    return value
 
 
 def compact_result(name, result, arguments=None):
@@ -103,11 +107,12 @@ def compact_result(name, result, arguments=None):
     if name == "exec_command":
         summary = _test_summary(value, (arguments or {}).get("command", ""))
         if summary is not None:
-            value.pop("stdout", None)
-            value.pop("stderr", None)
             value["test_summary"] = summary
-            # The reply is a summary; the retained spool may exceed the preview.
-            value.pop("truncated", None)
+            if summary["status"] != "failed":
+                value.pop("stdout", None)
+                value.pop("stderr", None)
+                # The reply is a summary; the retained spool may exceed the preview.
+                value.pop("truncated", None)
     if name in {"workspace_switch", "workspace_use_local"}:
         redundant = {"thread_id", "workspace_id", "project_root", "target_id",
                      "created_at", "updated_at", "previous"}

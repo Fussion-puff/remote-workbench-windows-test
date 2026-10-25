@@ -86,8 +86,16 @@ def test_unittest_success_summary_requires_complete_valid_footer_and_zero_exit()
         "title": "3 项测试通过",
         "state": "success",
         "count": 3,
+        "tests_run": 3,
+        "reported_skips": 0,
+        "executed": 3,
+        "passed": 3,
+        "report_status": "success",
+        "process_status": "success",
         "detail": "耗时 0.012 秒",
         "complete": True,
+        "total": 3,
+        "skipped": 0,
     }
 
 
@@ -116,30 +124,34 @@ def test_unittest_success_needs_exit_code_and_finished_record():
     assert summarize_output(output, {"status": "timeout", "exit_code": 0}, "stdout", complete=True) is None
 
 
-def test_unittest_skipped_counts_share_explicit_total_and_execution_semantics():
+def test_unittest_skipped_counts_do_not_guess_subtest_execution_semantics():
     record = {"status": "finished", "exit_code": 0}
     all_skipped = summarize_output(
         "test_skipped (tests.Example) ... skipped 'missing optional environment'\n\n"
         "----------------------------------------------------------------------\nRan 1 test in 0.001s\n\nOK (skipped=1)\n",
         record, "stderr", complete=True,
     )
-    assert all_skipped["state"] == "skipped"
-    assert all_skipped["title"] == "1 项测试全部跳过"
-    assert all_skipped["count"] == all_skipped["total"] == 1
-    assert all_skipped["skipped"] == 1 and all_skipped["executed"] == 0
+    assert all_skipped["state"] == "completed"
+    assert all_skipped["tests_run"] == all_skipped["count"] == all_skipped["total"] == 1
+    assert all_skipped["reported_skips"] == all_skipped["skipped"] == 1
+    assert all_skipped["executed"] is all_skipped["passed"] is None
+    assert all_skipped["process_status"] == "success"
 
     partial = summarize_output(
         "s.\nRan 2 tests in 0.002s\n\nOK (skipped=1)\n",
         record, "stdout", complete=True,
     )
-    assert partial["state"] == "success"
-    assert partial["count"] == partial["total"] == 2
-    assert partial["skipped"] == 1 and partial["executed"] == 1 and partial["passed"] == 1
+    assert partial["state"] == "completed"
+    assert partial["tests_run"] == partial["count"] == partial["total"] == 2
+    assert partial["reported_skips"] == partial["skipped"] == 1
+    assert partial["executed"] is partial["passed"] is None
 
     ordinary = summarize_output("Ran 3 tests in 0.012s\n\nOK\n", record, "stderr", complete=True)
     assert ordinary == {
         "kind": "tests", "title": "3 项测试通过", "state": "success", "count": 3,
-        "detail": "耗时 0.012 秒", "complete": True,
+        "tests_run": 3, "reported_skips": 0, "executed": 3, "passed": 3,
+        "report_status": "success", "process_status": "success",
+        "detail": "耗时 0.012 秒", "complete": True, "total": 3, "skipped": 0,
     }
 
 
@@ -149,18 +161,21 @@ def test_unittest_expected_failures_are_counted_and_unknown_footer_is_not_summar
         "----------------------------------------------------------------------\nRan 1 test in 0.001s\n\nOK (expected failures=1)\n",
         {"status": "finished", "exit_code": 0}, "stderr", complete=True,
     )
-    assert expected_failure["title"] == "测试完成（共 1 项，预期失败 1 项）"
-    assert expected_failure["state"] == "success"
+    assert expected_failure["title"] == "测试报告完成（框架运行 1 项，预期失败 1 项，执行 1 项，通过 0 项）"
+    assert expected_failure["state"] == "completed"
     assert expected_failure["expected_failures"] == 1
     assert expected_failure["passed"] == 0 and expected_failure["executed"] == 1
+    assert expected_failure["process_status"] == "success"
 
     mixed = summarize_output(
         ".s.\nRan 3 tests in 0.001s\n\nOK (skipped=1, expected failures=1)\n",
         {"status": "finished", "exit_code": 0}, "stderr", complete=True,
     )
-    assert mixed["total"] == 3 and mixed["skipped"] == 1 and mixed["executed"] == 2
-    assert mixed["expected_failures"] == 1 and mixed["passed"] == 1
-    assert "跳过 1 项" in mixed["title"]
+    assert mixed["tests_run"] == mixed["total"] == 3
+    assert mixed["reported_skips"] == mixed["skipped"] == 1
+    assert mixed["executed"] is mixed["passed"] is None
+    assert mixed["expected_failures"] == 1
+    assert "执行数和通过数未知" in mixed["title"]
 
     unexpected_success = summarize_output(
         "Ran 1 test in 0.001s\n\nFAILED (unexpected successes=1)\n",
@@ -168,14 +183,19 @@ def test_unittest_expected_failures_are_counted_and_unknown_footer_is_not_summar
     )
     assert unexpected_success["state"] == "failed"
     assert unexpected_success["unexpected_successes"] == 1
+    assert unexpected_success["executed"] == 1 and unexpected_success["passed"] is None
+    assert unexpected_success["report_status"] == unexpected_success["process_status"] == "failed"
     assert summarize_output(
         "s\nRan 1 test in 0.001s\n\nOK (skipped=1, future counter=1)\n",
         {"status": "finished", "exit_code": 0}, "stderr", complete=True,
     ) is None
-    assert summarize_output(
+    many_subtest_skips = summarize_output(
         "Ran 1 test in 0.001s\n\nOK (skipped=2)\n",
         {"status": "finished", "exit_code": 0}, "stderr", complete=True,
-    ) is None
+    )
+    assert many_subtest_skips["tests_run"] == 1
+    assert many_subtest_skips["reported_skips"] == 2
+    assert many_subtest_skips["executed"] is many_subtest_skips["passed"] is None
     assert summarize_output(
         "Ran 0 tests in 0.001s\n\nOK\n",
         {"status": "finished", "exit_code": 0}, "stderr", complete=True,
@@ -189,9 +209,11 @@ def test_failed_unittest_footer_never_derives_passed_from_other_counts():
         {"status": "finished", "exit_code": 1}, "stderr", complete=True,
     )
     assert mixed["state"] == "failed"
-    assert mixed["total"] == 3 and mixed["skipped"] == 1 and mixed["executed"] == 2
+    assert mixed["tests_run"] == mixed["total"] == 3
+    assert mixed["reported_skips"] == mixed["skipped"] == 1
+    assert mixed["executed"] is None and mixed["passed"] is None
     assert mixed["reported_failures"] == 1
-    assert "passed" not in mixed
+    assert mixed["passed"] is None
 
     # Failure counts may count several failing subtests inside a single test;
     # they cannot be subtracted from Ran N to infer the passing test count.
@@ -203,9 +225,9 @@ def test_failed_unittest_footer_never_derives_passed_from_other_counts():
     )
     assert subtests["reported_failures"] == 2
     assert subtests["expected_failures"] == 1
-    assert subtests["total"] == 2 and subtests["executed"] == 2
+    assert subtests["tests_run"] == subtests["total"] == 2 and subtests["executed"] == 2
     assert subtests["failure_count"] == 2
-    assert "passed" not in subtests
+    assert subtests["passed"] is None
 
 
 def test_diff_summary_ignores_git_headers_and_counts_only_hunk_lines():

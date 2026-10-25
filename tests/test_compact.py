@@ -19,13 +19,28 @@ def result(**updates):
 def test_only_plain_complete_success_is_summarized():
     source = result()
     value = compact_result("exec_command", source, {"command": "python3 -m unittest -v"})
-    assert value["test_summary"] == {"status": "passed", "tests": 1}
+    assert value["test_summary"] == {
+        "status": "passed", "tests": 1, "tests_run": 1, "reported_skips": 0,
+        "executed": 1, "passed": 1, "report_status": "success", "process_status": "success",
+        "total": 1, "skipped": 0,
+    }
     assert "stderr" not in value and value["exit_code"] == 0
     assert source["stderr"]  # projection does not mutate audit/source data
-    for changes in ({"exit_code": 1}, {"timed_out": True}, {"execution_state": "remote_state_unknown"},
+    failed_but_recognized = compact_result(
+        "exec_command", dict(source, exit_code=1), {"command": "python3 -m unittest -v"}
+    )
+    assert failed_but_recognized["test_summary"]["status"] == "failed"
+    assert failed_but_recognized["test_summary"]["process_status"] == "failed"
+    assert failed_but_recognized["stderr"] == source["stderr"]
+    failed_footer = compact_result(
+        "exec_command", dict(source, stderr=source["stderr"].replace("OK", "FAILED (failures=1)")),
+        {"command": "python3 -m unittest -v"},
+    )
+    assert failed_footer["test_summary"]["report_status"] == "failed"
+    assert failed_footer["stderr"].endswith("FAILED (failures=1)\n")
+    for changes in ({"timed_out": True}, {"execution_state": "remote_state_unknown"},
                     {"stderr": "warning: useful details\n" + source["stderr"]},
-                    {"stdout": "fixture diagnostics\n"}, {"truncated": True},
-                    {"stderr": source["stderr"].replace("OK", "FAILED (failures=1)")}):
+                    {"stdout": "fixture diagnostics\n"}, {"truncated": True}):
         changed = dict(source, **changes)
         visible = compact_result("exec_command", changed, {"command": "python3 -m unittest -v"})
         assert "test_summary" not in visible
@@ -56,7 +71,9 @@ def test_skipped_unittest_counts_are_explicit_and_all_skipped_is_not_passed():
     )
     value = compact_result("exec_command", skipped, {"command": "python3 -m unittest -v"})
     assert value["test_summary"] == {
-        "status": "skipped", "tests": 0, "total": 1, "skipped": 1, "executed": 0,
+        "status": "completed", "tests": None, "tests_run": 1, "reported_skips": 1,
+        "executed": None, "passed": None, "report_status": "success", "process_status": "success",
+        "total": 1, "skipped": 1,
     }
     assert "stderr" not in value
     assert skipped["stderr"].startswith("test_skipped")
@@ -67,7 +84,9 @@ def test_skipped_unittest_counts_are_explicit_and_all_skipped_is_not_passed():
                              "Ran 2 tests in 0.002s\n\nOK (skipped=1)\n"))
     value = compact_result("exec_command", partial, {"command": "python3 -m unittest -v"})
     assert value["test_summary"] == {
-        "status": "passed", "tests": 1, "total": 2, "skipped": 1, "executed": 1,
+        "status": "completed", "tests": None, "tests_run": 2, "reported_skips": 1,
+        "executed": None, "passed": None, "report_status": "success", "process_status": "success",
+        "total": 2, "skipped": 1,
     }
 
 
@@ -75,20 +94,28 @@ def test_nonverbose_skips_expected_failures_unknown_counters_and_failures():
     command = {"command": "python3 -m unittest"}
     nonverbose = result(stderr="s\nRan 1 test in 0.001s\n\nOK (skipped=1)\n")
     assert compact_result("exec_command", nonverbose, command)["test_summary"] == {
-        "status": "skipped", "tests": 0, "total": 1, "skipped": 1, "executed": 0,
+        "status": "completed", "tests": None, "tests_run": 1, "reported_skips": 1,
+        "executed": None, "passed": None, "report_status": "success", "process_status": "success",
+        "total": 1, "skipped": 1,
     }
 
     expected = result(stderr=("test_expected (tests.Example) ... expected failure\n\n"
                               "----------------------------------------------------------------------\n"
                               "Ran 1 test in 0.001s\n\nOK (expected failures=1)\n"))
     assert compact_result("exec_command", expected, {"command": "python3 -m unittest -v"})["test_summary"] == {
-        "status": "completed", "tests": 0, "total": 1, "skipped": 0,
-        "executed": 1, "expected_failures": 1,
+        "status": "completed", "tests": 0, "tests_run": 1, "reported_skips": 0,
+        "executed": 1, "passed": 0, "report_status": "success", "process_status": "success",
+        "total": 1, "skipped": 0, "expected_failures": 1,
     }
 
     unexpected = result(stderr="Ran 1 test in 0.001s\n\nFAILED (unexpected successes=1)\n")
     visible = compact_result("exec_command", unexpected, command)
-    assert "test_summary" not in visible and visible["stderr"] == unexpected["stderr"]
+    assert visible["test_summary"] == {
+        "status": "failed", "tests": None, "tests_run": 1, "reported_skips": 0,
+        "executed": 1, "passed": None, "report_status": "failed", "process_status": "success",
+        "total": 1, "skipped": 0, "unexpected_successes": 1,
+    }
+    assert visible["stderr"] == unexpected["stderr"]
 
     unknown = result(stderr="s\nRan 1 test in 0.001s\n\nOK (skipped=1, future counter=1)\n")
     visible = compact_result("exec_command", unknown, command)
@@ -96,7 +123,10 @@ def test_nonverbose_skips_expected_failures_unknown_counters_and_failures():
 
     nonzero = result(exit_code=1, stderr="Ran 1 test in 0.001s\n\nOK (skipped=1)\n")
     visible = compact_result("exec_command", nonzero, command)
-    assert "test_summary" not in visible and visible["stderr"] == nonzero["stderr"]
+    assert visible["test_summary"]["status"] == "failed"
+    assert visible["test_summary"]["process_status"] == "failed"
+    assert visible["test_summary"]["report_status"] == "success"
+    assert visible["stderr"] == nonzero["stderr"]
 
     warning = result(stderr="warning: optional dependency unavailable\n" + nonverbose["stderr"])
     visible = compact_result("exec_command", warning, command)
@@ -112,7 +142,7 @@ def test_truncated_skipped_result_uses_complete_unchanged_spool(tmp_path):
         (path / "stderr").write_text(text)
         original = result(truncated=True, output_id=output_id, stderr="partial preview")
         value = compact_result("exec_command", original, {"command": "python3 -m unittest"})
-        assert value["test_summary"]["status"] == "skipped"
+        assert value["test_summary"]["status"] == "completed"
         assert (path / "stderr").read_text() == text
 
         # An incomplete or unavailable spool keeps the preview and its warning.
