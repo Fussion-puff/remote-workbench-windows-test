@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.0a14 (develop)
+
+- Route scripts, test runners and builds through the same ordinary command/job lifecycle. Remove automatic project fingerprints, test attempts, cache invalidation and test-evidence audit/collector callbacks from execution and recovery.
+- Make legacy test history an explicit, local-only `workspace_resume(include_legacy_test_history=True)` read. Preserve stored observations without asserting that they apply to current code.
+- Make project content scanning opt-in through `workspace_snapshot(scan_content=True, max_files=..., max_content_bytes=...)`; default snapshots inspect metadata and Git state without content fingerprints or test-history comparison.
+- Keep factual command/output/job records, original-target recovery, guarded edits and copy delivery protections. Preserve truncation in compact replies, and keep ambiguous unittest/subTest counts unknown.
+- Align the development scope with generic execution and recovery. Direct mode and limited shared-directory coordination remain later work; existing copy targets, historical records and the independent stable installation retain their behavior.
+
 ## 0.3.0a13 (develop)
 
 - Separate unittest's reported top-level tests and skips. Skipped subtests can make execution/pass counts unknowable; compact replies and HTML use the same facts and retain raw output access.

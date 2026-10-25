@@ -111,8 +111,6 @@ def compact_result(name, result, arguments=None):
             if summary["status"] != "failed":
                 value.pop("stdout", None)
                 value.pop("stderr", None)
-                # The reply is a summary; the retained spool may exceed the preview.
-                value.pop("truncated", None)
     if name in {"workspace_switch", "workspace_use_local"}:
         redundant = {"thread_id", "workspace_id", "project_root", "target_id",
                      "created_at", "updated_at", "previous"}
@@ -134,13 +132,6 @@ def compact_result(name, result, arguments=None):
         origin_fields = {"node", "boot_id", "version", "pid", "start_token", "task_id", "task_dir",
                          "backend", "timeout_seconds", "workload_pid", "pgid", "state", "reason", "exit_code"}
         value["remote_task"] = {key: item for key, item in task.items() if key not in origin_fields}
-    evidence = value.get("test_evidence")
-    if (value.get("exit_code") == 0 and isinstance(evidence, dict)
-            and evidence.get("status") == "passed" and evidence.get("applies_to_current_code") is True):
-        redundant = {"evidence", "environment_evidence", "environment_limit"}
-        value["test_evidence"] = {key: item for key, item in evidence.items() if key not in redundant}
-        value["test_evidence"]["environment_verified"] = False
-        value.pop("test_evidence_operation_id", None)
     for key in ("stdout", "stderr"):
         if value.get(key) == "":
             value.pop(key)

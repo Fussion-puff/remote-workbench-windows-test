@@ -1,8 +1,8 @@
-"""End-to-end recovery through real MCP stdio processes and a local SSH shim.
+"""C2 recovery with real MCP stdio processes and a local SSH shim.
 
-The shim runs the repository's real worker and supervisor locally. It drops one
-successful job_start response after observing the persisted remote job files.
-No SSH credentials, remote host, product fault flag, or spawn monkeypatch is used.
+The shim drops one successful job_start reply after the worker persisted its
+job. A second MCP process switches to B, then recovers A's same job and output
+handle. The shim never invokes a real SSH client or server.
 """
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ import asyncio
 import json
 import os
 from pathlib import Path
+import shlex
 import sqlite3
 import subprocess
 import sys
@@ -36,6 +37,8 @@ import re
 import subprocess
 import sys
 import threading
+import ast
+import base64
 
 REMOTE_HOME = {str(remote_home)!r}
 SAFE_SHELL = {str(safe_shell)!r}
@@ -55,8 +58,7 @@ if args[:2] == ["-O", "check"]:
 if len(args) < 2:
     raise SystemExit(2)
 target, command = args[-2], args[-1]
-env = dict(os.environ)
-env.update(HOME=REMOTE_HOME, SHELL=SAFE_SHELL,
+env = dict(os.environ, HOME=REMOTE_HOME, SHELL=SAFE_SHELL,
            REMOTE_WORKBENCH_LOGIN_SHELL=SAFE_SHELL,
            RWB_TEST_LAUNCH_COUNTER=LAUNCH_COUNTER,
            RWB_TEST_RELEASE_GATE=RELEASE_GATE)
@@ -65,9 +67,96 @@ env["PATH"] = {str(bin_dir)!r} + os.pathsep + python_dir + os.pathsep + env.get(
 process = subprocess.Popen(["/bin/bash", "--noprofile", "--norc", "-c", command],
                            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                            stderr=subprocess.PIPE, env=env, bufsize=0)
-request = {{"op": None}}
+request = {{}}
 request_bytes = bytearray()
 captured_stdout = bytearray()
+
+def record_request(chunk):
+    if request:
+        return
+    request_bytes.extend(chunk)
+    try:
+        decoded = request_bytes.decode("utf-8")
+        value, _ = json.JSONDecoder().raw_decode(decoded.lstrip())
+    except (UnicodeDecodeError, ValueError):
+        return
+    if not isinstance(value, dict) or not isinstance(value.get("op"), str):
+        return
+    request.update(value)
+
+def command_argv(current_command):
+    for _ in range(4):
+        match = re.search(r'base64\\.b64decode\\("([A-Za-z0-9+/=]+)"\\)', current_command)
+        if not match:
+            return None
+        try:
+            program = base64.b64decode(match.group(1), validate=True).decode("utf-8")
+            tree = ast.parse(program)
+            nested_command = None
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Assign):
+                    continue
+                names = [target.id for target in node.targets if isinstance(target, ast.Name)]
+                if "argv" in names:
+                    return ast.literal_eval(node.value)
+                if "_settings" in names:
+                    settings = ast.literal_eval(node.value)
+                    if isinstance(settings, dict):
+                        nested_command = settings.get("command")
+            if not isinstance(nested_command, str):
+                return None
+            current_command = nested_command
+        except (ValueError, TypeError, SyntaxError, UnicodeDecodeError):
+            return None
+    return None
+
+def fingerprint_request():
+    try:
+        argv = command_argv(command)
+        if not isinstance(argv, list) or len(argv) < 6:
+            return None
+        if argv[0:2] != ["python3", "-c"] or argv[3] != "fingerprint":
+            return None
+        budget = json.loads(argv[5])
+        return {{"target": target, "op": "fingerprint",
+                "project_root": argv[4], "max_files": budget.get("max_files"),
+                "max_bytes": budget.get("max_bytes")}}
+    except (ValueError, TypeError, SyntaxError, UnicodeDecodeError):
+        return None
+
+def cancel_request():
+    current_command = command
+    for _ in range(4):
+        match = re.search(r'base64\\.b64decode\\("([A-Za-z0-9+/=]+)"\\)', current_command)
+        if not match:
+            return None
+        try:
+            program = base64.b64decode(match.group(1), validate=True).decode("utf-8")
+            tree = ast.parse(program)
+            nested_command = None
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "cancel_task":
+                    if node.args:
+                        parts = [item.value for item in ast.walk(node.args[0])
+                                 if isinstance(item, ast.Constant) and isinstance(item.value, str)]
+                        job_ids = [value for value in parts
+                                   if re.fullmatch(r"[a-f0-9]{{32}}", value)]
+                        if job_ids:
+                            return {{"job_id": job_ids[0]}}
+                    return {{"job_id": None}}
+                if not isinstance(node, ast.Assign):
+                    continue
+                names = [target.id for target in node.targets if isinstance(target, ast.Name)]
+                if "_settings" in names:
+                    settings = ast.literal_eval(node.value)
+                    if isinstance(settings, dict):
+                        nested_command = settings.get("command")
+            if not isinstance(nested_command, str):
+                return None
+            current_command = nested_command
+        except (ValueError, TypeError, SyntaxError, UnicodeDecodeError):
+            return None
+    return None
 
 def relay_input():
     reader = getattr(sys.stdin.buffer, "read1", sys.stdin.buffer.read)
@@ -75,16 +164,7 @@ def relay_input():
         chunk = reader(4096)
         if not chunk:
             break
-        if request["op"] is None:
-            request_bytes.extend(chunk)
-            try:
-                decoded = request_bytes.decode("utf-8")
-                value, _ = json.JSONDecoder().raw_decode(decoded.lstrip())
-                if isinstance(value, dict):
-                    request["op"] = value.get("op")
-                    request["job_id"] = value.get("job_id")
-            except (UnicodeDecodeError, ValueError):
-                pass
+        record_request(chunk)
         try:
             process.stdin.write(chunk)
             process.stdin.flush()
@@ -101,32 +181,29 @@ def relay_stderr():
         sys.stderr.buffer.write(chunk)
         sys.stderr.buffer.flush()
 
-def capture_stdout():
+def relay_stdout():
     reader = getattr(process.stdout, "read1", process.stdout.read)
     while chunk := reader(65536):
         if request.get("op") == "job_start":
-            # Only the one response under test is delayed, so we can inspect
-            # persisted status/origin before deciding whether to drop it.
             captured_stdout.extend(chunk)
         else:
-            # In particular, remote_log_follow is a live stream. Relay every
-            # other SSH command as it arrives instead of waiting for EOF.
             sys.stdout.buffer.write(chunk)
             sys.stdout.buffer.flush()
 
 threads = [threading.Thread(target=relay_input, daemon=True),
            threading.Thread(target=relay_stderr, daemon=True),
-           threading.Thread(target=capture_stdout, daemon=True)]
+           threading.Thread(target=relay_stdout, daemon=True)]
 for thread in threads:
     thread.start()
 return_code = process.wait()
 for thread in threads:
     thread.join(timeout=3)
 stdout = bytes(captured_stdout)
-drop = False
-persisted = False
+op = request.get("op")
 job_dir = None
-if request.get("op") == "job_start" and Path(DROP_GATE).exists() and return_code == 0:
+persisted = False
+drop = False
+if op == "job_start" and Path(DROP_GATE).exists() and return_code == 0:
     marker = re.search(rb"\\x1eREMOTE_WORKBENCH_RESULT_[0-9a-f]+:\\x1f", stdout)
     if marker:
         try:
@@ -144,37 +221,55 @@ if request.get("op") == "job_start" and Path(DROP_GATE).exists() and return_code
         except FileNotFoundError:
             pass
 if drop:
-    append_json(DROPPED_LOG, {{"op": request.get("op"), "job_id": request.get("job_id"),
+    append_json(DROPPED_LOG, {{"op": op, "job_id": request.get("job_id"),
                                "job_dir": job_dir, "persisted": persisted,
-                               "response_was_present": b"REMOTE_WORKBENCH_RESULT_" in stdout}})
+                               "response_was_present": b"REMOTE_WORKBENCH_RESULT_" in stdout,
+                               "command": request.get("command")}})
+elif op == "job_start":
+    sys.stdout.buffer.write(stdout)
+    sys.stdout.buffer.flush()
+direct = fingerprint_request() if op is None else None
+if direct:
+    inferred = "fingerprint"
+    direct = dict(direct)
+elif op is None and cancel_request() is not None:
+    direct = cancel_request()
+    inferred = "cancel_task"
+elif op is None:
+    inferred = ("cancel_task" if "cancel_task(" in command else
+                "job_log_follow" if "follow_logs(" in command else "shell_command")
 else:
-    if request.get("op") == "job_start":
-        sys.stdout.buffer.write(stdout)
-        sys.stdout.buffer.flush()
-append_json(EVENT_LOG, {{"target": target, "op": request.get("op"),
-                        "job_id": request.get("job_id"), "dropped": drop,
-                        "server_pid": os.getppid(), "exit_code": return_code}})
+    inferred = op
+append_json(EVENT_LOG, {{"target": target, "op": inferred,
+                        "job_id": (direct or {{}}).get("job_id", request.get("job_id")),
+                        "command": request.get("command"),
+                        "project_root": (direct or {{}}).get("project_root", request.get("project_root")),
+                        "max_files": (direct or {{}}).get("max_files", request.get("max_files")),
+                        "max_bytes": (direct or {{}}).get("max_bytes", request.get("max_bytes")),
+                        "dropped": drop, "server_pid": os.getppid(),
+                        "exit_code": return_code}})
 raise SystemExit(return_code)
 """
     shim = bin_dir / "ssh"
     shim.write_text(source, encoding="utf-8")
     shim.chmod(0o700)
-    (bin_dir / "python3").symlink_to(sys.executable)
+    python_launcher = bin_dir / "python3"
+    python_launcher.write_text(
+        f"#!/bin/sh\nexec {shlex.quote(str(Path(sys.prefix) / 'bin' / 'python'))} \"$@\"\n",
+        encoding="utf-8",
+    )
+    python_launcher.chmod(0o700)
 
 
-def _value(result):
-    if result.structuredContent is not None:
-        return result.structuredContent
-    assert result.content, f"MCP returned no content: {result!r}"
-    try:
-        return json.loads(result.content[0].text)
-    except (ValueError, AttributeError) as exc:
-        raise AssertionError(f"MCP returned non-JSON content: {result!r}") from exc
-
-
-async def _call(client: ClientSession, tool: str, arguments: dict | None = None):
-    result = await client.call_tool(tool, arguments or {}, meta={"threadId": THREAD_ID})
-    return _value(result), result
+def _init_fixture_repo(path: Path) -> None:
+    """Give each fixture an independent Git boundary, outside pytest's parent."""
+    subprocess.run(["git", "init", "-q", str(path)], check=True)
+    subprocess.run(["git", "-C", str(path), "add", "."], check=True)
+    subprocess.run([
+        "git", "-C", str(path), "-c", "user.name=stdio acceptance",
+        "-c", "user.email=stdio-acceptance@example.invalid", "commit", "-qm",
+        "fixture",
+    ], check=True)
 
 
 def _events(path: Path) -> list[dict]:
@@ -183,12 +278,15 @@ def _events(path: Path) -> list[dict]:
     return [json.loads(line) for line in path.read_text().splitlines() if line]
 
 
-def _write_acceptance_evidence(path: Path, filename: str, value: dict) -> None:
-    path.mkdir(parents=True, exist_ok=True)
-    destination = path / filename
-    temporary = destination.with_suffix(".json.tmp")
-    temporary.write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
-    temporary.replace(destination)
+def _value(result):
+    assert not result.isError, result
+    assert result.content, f"MCP returned no content: {result!r}"
+    return json.loads(result.content[0].text)
+
+
+async def _call(client: ClientSession, tool: str, arguments: dict | None = None):
+    result = await client.call_tool(tool, arguments or {}, meta={"threadId": THREAD_ID})
+    return _value(result)
 
 
 def _reserved_job_id(db_path: Path) -> str | None:
@@ -202,133 +300,97 @@ def _reserved_job_id(db_path: Path) -> str | None:
     return row[0] if row else None
 
 
-def _attempt_row(db_path: Path, *, attempt_id: str | None = None,
-                 job_id: str | None = None) -> dict | None:
-    if not db_path.exists():
-        return None
+def _registry_rows(db_path: Path) -> dict[str, list[tuple]]:
     with sqlite3.connect(db_path) as db:
-        db.row_factory = sqlite3.Row
-        if attempt_id is not None:
-            row = db.execute(
-                "SELECT * FROM test_attempts WHERE attempt_id = ?", (attempt_id,)
-            ).fetchone()
-        else:
-            row = db.execute(
-                "SELECT * FROM test_attempts WHERE job_id = ? ORDER BY attempt_order DESC LIMIT 1",
-                (job_id,),
-            ).fetchone()
-    if row is None:
-        return None
-    result = dict(row)
-    for column, key in (("target_json", "target"), ("before_json", "before"),
-                        ("after_json", "after"), ("summary_json", "summary"),
-                        ("observation_json", "observation")):
-        raw = result.pop(column, None)
-        result[key] = json.loads(raw) if isinstance(raw, str) and raw else None
-    return result
+        return {
+            "last_tests": db.execute(
+                "SELECT * FROM last_tests ORDER BY workspace_id, target_id"
+            ).fetchall(),
+            "test_attempts": db.execute(
+                "SELECT * FROM test_attempts ORDER BY attempt_order, attempt_id"
+            ).fetchall(),
+        }
 
 
-def _latest_attempt_row(db_path: Path, workspace_id: str, target_id: str) -> dict | None:
-    if not db_path.exists():
-        return None
-    with sqlite3.connect(db_path) as db:
-        row = db.execute(
-            "SELECT attempt_id FROM test_attempts WHERE workspace_id = ? AND target_id = ? "
-            "ORDER BY attempt_order DESC LIMIT 1",
-            (workspace_id, target_id),
-        ).fetchone()
-    return _attempt_row(db_path, attempt_id=row[0]) if row else None
+def _seed_legacy_rows(db_path: Path, binding: dict) -> None:
+    from remote_workbench.workspace_registry import Registry, WorkspaceTarget
+
+    registry = Registry(db_path)
+    target = WorkspaceTarget(
+        binding["target_id"], binding["workspace_id"], binding["host"],
+        binding["source_cwd"], binding["cwd"], binding["project_root"],
+    )
+    attempt = registry.begin_test_attempt(
+        binding["workspace_id"], target, attempt_id="b" * 32,
+        job_id="legacy-stdio-attempt", command="python3 -m unittest -v",
+        cwd=binding["cwd"], execution_kind="foreground", started_at=123.0,
+        before={"code": {"complete": True, "digest": "seed-before"}},
+        revision=binding["revision"],
+    )
+    registry.update_test_attempt(
+        binding["workspace_id"], attempt["attempt_id"], state="finished",
+        process_exit_status="success", exit_code=0, test_result="success",
+        summary={"tests_run": 1, "passed": 1},
+        after={"code": {"complete": True, "digest": "seed-after"}},
+        finished_at=124.0,
+    )
+    registry.save_test(binding["workspace_id"], binding["target_id"], {
+        "attempt_id": attempt["attempt_id"],
+        "attempt_order": attempt["attempt_order"],
+        "status": "legacy-success-marker",
+        "command": "python3 -m unittest -v",
+        "code": {"complete": True, "digest": "legacy-digest"},
+    })
 
 
-def _last_test_row(db_path: Path, workspace_id: str, target_id: str) -> dict | None:
-    with sqlite3.connect(db_path) as db:
-        row = db.execute(
-            "SELECT observation, attempt_order, attempt_id FROM last_tests "
-            "WHERE workspace_id = ? AND target_id = ?",
-            (workspace_id, target_id),
-        ).fetchone()
-    if row is None:
-        return None
-    value = json.loads(row[0])
-    value.setdefault("attempt_order", row[1])
-    value.setdefault("attempt_id", row[2])
-    return value
-
-
-def _local_record(state_dir: Path, workspace_id: str, output_id: str) -> dict | None:
-    path = state_dir / "audit" / workspace_id / output_id / "record.json"
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (FileNotFoundError, json.JSONDecodeError):
-        return None
-
-
-def _local_stdout(state_dir: Path, workspace_id: str, output_id: str) -> str:
-    path = state_dir / "audit" / workspace_id / output_id / "stdout"
-    try:
-        return path.read_text(encoding="utf-8")
-    except (FileNotFoundError, UnicodeDecodeError):
-        return ""
-
-
-async def _wait_for_local_collector(state_dir: Path, workspace_id: str, output_id: str,
-                                    *, timeout: float, terminal: bool) -> dict:
+async def _wait_for_local_record(state_dir: Path, workspace_id: str, output_id: str,
+                                 *, timeout: float, marker: str) -> dict:
     deadline = time.monotonic() + timeout
     last = None
+    stdout_path = state_dir / "audit" / workspace_id / output_id / "stdout"
+    record_path = state_dir / "audit" / workspace_id / output_id / "record.json"
     while time.monotonic() < deadline:
-        last = _local_record(state_dir, workspace_id, output_id)
-        if last is not None:
-            if terminal:
-                if last.get("sync_state") == "complete" and last.get("execution_state") == "finished":
-                    return last
-            elif (_local_stdout(state_dir, workspace_id, output_id).find(
-                    "ORIGINAL_PROJECT_STARTED") >= 0):
-                return last
-        await asyncio.sleep(0.05)
-    raise AssertionError(f"local collector did not reach expected state: {last!r}")
-
-
-async def _wait_for_test_attempt(db_path: Path, *, attempt_id: str,
-                                 timeout: float) -> dict:
-    deadline = time.monotonic() + timeout
-    last = None
-    while time.monotonic() < deadline:
-        last = _attempt_row(db_path, attempt_id=attempt_id)
-        if last is not None and last.get("state") in {
-                "finished", "failed", "cancelled", "timed_out", "unknown", "rejected"}:
+        try:
+            last = json.loads(record_path.read_text(encoding="utf-8"))
+            output = stdout_path.read_text(encoding="utf-8")
+        except (OSError, ValueError):
+            await asyncio.sleep(0.05)
+            continue
+        if marker in output:
             return last
         await asyncio.sleep(0.05)
-    raise AssertionError(f"test attempt did not become terminal: {last!r}")
+    raise AssertionError(f"local collector did not receive {marker!r}: {last!r}")
 
 
-async def _wait_for_attempt_state(db_path: Path, *, attempt_id: str, expected: str,
-                                  timeout: float) -> dict:
+async def _wait_for_local_terminal_record(state_dir: Path, workspace_id: str,
+                                          output_id: str, *, timeout: float) -> dict:
     deadline = time.monotonic() + timeout
+    record_path = state_dir / "audit" / workspace_id / output_id / "record.json"
     last = None
     while time.monotonic() < deadline:
-        last = _attempt_row(db_path, attempt_id=attempt_id)
-        if last is not None and last.get("state") == expected:
+        try:
+            last = json.loads(record_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            await asyncio.sleep(0.05)
+            continue
+        if (last.get("sync_state") == "complete" and
+                last.get("execution_state") in {"finished", "failed", "cancelled", "timed_out"}):
             return last
         await asyncio.sleep(0.05)
-    raise AssertionError(
-        f"test attempt did not reach {expected!r}: {last!r}")
+    raise AssertionError(f"local collector did not publish terminal state: {last!r}")
 
 
-def _init_fixture_repo(path: Path) -> None:
-    """Keep each fixture's Git boundary independent of pytest's temp parent."""
-    subprocess.run(["git", "init", "-q", str(path)], check=True)
-    subprocess.run(["git", "-C", str(path), "add", "."], check=True)
-    subprocess.run([
-        "git", "-C", str(path), "-c", "user.name=stdio acceptance",
-        "-c", "user.email=stdio-acceptance@example.invalid", "commit", "-qm",
-        "fixture",
-    ], check=True)
+def _write_acceptance_evidence(path: Path, filename: str, value: dict) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    destination = path / filename
+    temporary = destination.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(destination)
 
 
 @pytest.mark.asyncio
 async def test_lost_job_start_reply_recovers_after_real_stdio_restart_and_target_switch(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    """Exercise C2's lost-ack recovery without a real SSH connection."""
     source_a = tmp_path / "source-a"
     source_b = tmp_path / "source-b"
     source_a.mkdir()
@@ -346,16 +408,16 @@ async def test_lost_job_start_reply_recovers_after_real_stdio_restart_and_target
         " def test_background_result(self):\n"
         "  print('ORIGINAL_PROJECT_STARTED', flush=True)\n"
         "  print('CURSOR_PREFIX_START' + 'p' * 500 + 'CURSOR_PREFIX_END', flush=True)\n"
+        "  if os.environ.get('RWB_TEST_COUNT_LAUNCH', '1') != '0':\n"
+        "   label = os.environ.get('RWB_TEST_LAUNCH_LABEL', 'A')\n"
+        "   with open(os.environ['RWB_TEST_LAUNCH_COUNTER'], 'a') as output: output.write(label + '\\n')\n"
         "  if os.environ.get('RWB_TEST_BYPASS_GATE') != '1':\n"
         "   gate = os.environ['RWB_TEST_RELEASE_GATE']\n"
         "   deadline = time.monotonic() + 45\n"
         "   while os.path.exists(gate) and time.monotonic() < deadline: time.sleep(0.025)\n"
         "   if os.path.exists(gate): raise AssertionError('acceptance gate timed out')\n"
-        "  if os.environ.get('RWB_TEST_COUNT_LAUNCH', '1') != '0':\n"
-        "   label = os.environ.get('RWB_TEST_LAUNCH_LABEL', 'A')\n"
-        "   with open(os.environ['RWB_TEST_LAUNCH_COUNTER'], 'a') as output: output.write(label + '\\n')\n"
         "  print('ORIGINAL_PROJECT_RESULT', flush=True)\n"
-        "  print('CURSOR_PAYLOAD_START' + 'x' * 400 + 'CURSOR_PAYLOAD_END')\n",
+        "  print('CURSOR_PAYLOAD_START' + 'x' * 400 + 'CURSOR_PAYLOAD_END', flush=True)\n",
         encoding="utf-8",
     )
     _init_fixture_repo(source_a)
@@ -378,26 +440,24 @@ async def test_lost_job_start_reply_recovers_after_real_stdio_restart_and_target
     event_log = tmp_path / "ssh-events.jsonl"
     drop_gate = tmp_path / "drop-first-job-start"
     dropped_log = tmp_path / "dropped-success.jsonl"
-    gate_dir = tmp_path / "release-gates"
-    gate_dir.mkdir()
-    release_gate = gate_dir / "hold-original-unittest"
+    release_gate = tmp_path / "hold-original-unittest"
     release_gate.touch()
     _write_ssh_shim(bin_dir, remote_home=remote_home, safe_shell=safe_shell,
                     launch_counter=launch_counter, event_log=event_log,
                     drop_gate=drop_gate, dropped_log=dropped_log,
                     release_gate=release_gate)
     monkeypatch.setenv("PATH", str(bin_dir) + os.pathsep + os.environ.get("PATH", ""))
-    evidence_dir = Path(os.environ.get("RWB_ACCEPTANCE_EVIDENCE_DIR", str(tmp_path)))
+
     config = tmp_path / "hosts.yaml"
     config.write_text(yaml.safe_dump({
         "default_host": "a",
         "hosts": {
             "a": {"ssh_host": "simulated-a", "default_cwd": str(source_a),
                   "execution_enabled": True, "job_timeout": 60,
-                  "terminate_grace_seconds": 1},
+                  "command_timeout": 30, "terminate_grace_seconds": 1},
             "b": {"ssh_host": "simulated-b", "default_cwd": str(source_b),
                   "execution_enabled": True, "job_timeout": 60,
-                  "terminate_grace_seconds": 1},
+                  "command_timeout": 30, "terminate_grace_seconds": 1},
         },
     }, sort_keys=True), encoding="utf-8")
     state_dir = tmp_path / "mcp-state"
@@ -406,67 +466,88 @@ async def test_lost_job_start_reply_recovers_after_real_stdio_restart_and_target
         "-m", "remote_workbench.session_server", "--config", str(config),
         "--data-dir", str(state_dir), "--viewer-port", "0",
     ])
-    drop_gate.touch()
-    job_id = None
-    background_attempt_id = None
-    output_id = None
-    completed = False
-    fast_test_command = (
+    evidence_dir = Path(os.environ.get("RWB_ACCEPTANCE_EVIDENCE_DIR", str(tmp_path)))
+    background_command = "python3 -m unittest -v"
+    fast_command = (
         "RWB_TEST_BYPASS_GATE=1 RWB_TEST_COUNT_LAUNCH=0 "
         "python3 -m unittest -v"
     )
-    background_test_command = "python3 -m unittest -v"
+    job_id = None
+    release_gate_removed = False
+    stop_requested = False
+    stop_terminal_confirmed = False
+    stop_cleanup_confirmed = False
+    rows_before = None
+    output_id = None
+    target_a_id = None
+    workspace_id = None
+    initial_start_pid = None
 
     try:
-        # The fast foreground run establishes a reliable prior observation for A.
-        # The later gated background attempt must not replace it until completion.
         async with stdio_client(params) as (reader, writer):
             async with ClientSession(reader, writer) as client:
                 await client.initialize()
-                bound_a, _ = await _call(client, "workspace_switch", {
+                binding_a = await _call(client, "workspace_switch", {
                     "host": "a", "cwd": str(source_a),
                 })
-                assert bound_a["bound"] is True
-                target_a_id = bound_a["target_id"]
-                project_a = Path(bound_a["project_root"])
-                workspace_id = bound_a["workspace_id"]
+                assert binding_a["bound"] is True
+                target_a_id = binding_a["target_id"]
+                workspace_id = binding_a["workspace_id"]
+                _seed_legacy_rows(registry_path, binding_a)
+                rows_before = _registry_rows(registry_path)
+                assert rows_before["last_tests"] and rows_before["test_attempts"]
 
-                baseline_test, _ = await _call(client, "exec_command", {
-                    "command": fast_test_command,
-                })
+                resume = await _call(client, "workspace_resume")
+                assert resume["remote_query_performed"] is False
+                assert "last_test" not in resume and "latest_test_attempt" not in resume
+                snapshot = await _call(client, "workspace_snapshot")
+                assert "content_fingerprint" not in snapshot
+                assert "test_evidence_comparison" not in snapshot
+                assert "latest_test_attempt" not in snapshot
+                assert not [e for e in _events(event_log) if e.get("op") == "fingerprint"]
+
+                baseline_test = await _call(client, "exec_command", {"command": fast_command})
                 assert baseline_test.get("exit_code") == 0, baseline_test
-                baseline_attempt = _latest_attempt_row(
-                    registry_path, workspace_id, target_a_id)
-                assert baseline_attempt is not None, "foreground test attempt was not persisted"
-                assert baseline_attempt["execution_kind"] == "foreground"
-                assert baseline_attempt["state"] == "finished"
-                assert baseline_attempt["process_exit_status"] == "success"
-                assert baseline_attempt["test_result"] == "success"
-                baseline_last = _last_test_row(registry_path, workspace_id, target_a_id)
-                assert baseline_last and baseline_last["attempt_id"] == baseline_attempt["attempt_id"]
+                assert baseline_test.get("output_id")
+                assert "test_evidence" not in baseline_test and "test_attempt" not in baseline_test
+                output_id = baseline_test["output_id"]
+                baseline_audit = await _call(client, "audit_get", {"operation_id": output_id})
+                assert baseline_audit["id"] == output_id
+                assert baseline_audit["command"] == fast_command
+                saved_stdout = await _call(client, "read_output", {
+                    "output_id": output_id, "stream": "stdout",
+                })
+                saved_stderr = await _call(client, "read_output", {
+                    "output_id": output_id, "stream": "stderr",
+                })
+                assert "ORIGINAL_PROJECT_STARTED" in saved_stdout["content"]
+                assert "Ran 1 test" in saved_stderr["content"]
+                assert _registry_rows(registry_path) == rows_before
 
+                drop_gate.touch()
+                start_result = {}
                 raw_start = await client.call_tool("start_job", {
-                    "command": background_test_command,
+                    "command": background_command,
                     "idempotency_key": IDEMPOTENCY_KEY,
                 }, meta={"threadId": THREAD_ID})
                 try:
                     start_result = _value(raw_start)
                 except AssertionError:
                     start_result = {}
-                job_id = start_result.get("job_id") or _reserved_job_id(
-                    registry_path)
+                job_id = start_result.get("job_id") or _reserved_job_id(registry_path)
                 assert job_id, start_result
                 assert (raw_start.isError or start_result.get("error") or
                         start_result.get("execution_state") == "unknown"), (
-                    "the test SSH shim must lose the successful worker reply"
+                    "the shim must drop the successful job_start response"
                 )
                 dropped = _events(dropped_log)
                 assert len(dropped) == 1 and dropped[0]["op"] == "job_start"
                 assert dropped[0]["job_id"] == job_id
                 assert dropped[0]["persisted"] is True
                 assert dropped[0]["response_was_present"] is True
-                assert not drop_gate.exists(), "the one-shot response-loss gate must be released"
-                expected_job_dir = project_a / ".remote-workbench-state" / "jobs" / job_id
+                assert dropped[0]["command"] == background_command
+                assert not drop_gate.exists(), "one-shot response-loss gate was not consumed"
+                expected_job_dir = Path(binding_a["project_root"]) / ".remote-workbench-state" / "jobs" / job_id
                 assert Path(dropped[0]["job_dir"]) == expected_job_dir
                 assert (expected_job_dir / "status.json").is_file()
                 assert (expected_job_dir / "origin.json").is_file()
@@ -474,445 +555,234 @@ async def test_lost_job_start_reply_recovers_after_real_stdio_restart_and_target
                     event for event in _events(event_log)
                     if event.get("op") == "job_start" and event.get("job_id") == job_id
                 )
-                background_attempt = _attempt_row(registry_path, job_id=job_id)
-                assert background_attempt is not None, "background test attempt was not persisted"
-                background_attempt_id = background_attempt["attempt_id"]
-                assert background_attempt["attempt_order"] > baseline_attempt["attempt_order"]
-                assert background_attempt["execution_kind"] == "background"
-                assert background_attempt["state"] == "unknown"
-                assert background_attempt["process_exit_status"] == "unknown"
-                assert background_attempt["command"] == background_test_command
-                assert background_attempt["cwd"] == str(project_a)
-                assert background_attempt["target"]["target_id"] == target_a_id
-                assert background_attempt["target"]["host"] == "a"
-                assert background_attempt["target"]["source_cwd"] == str(source_a)
-                assert background_attempt["target"]["project_root"] == str(project_a)
-                assert background_attempt["started_at"] > 0
-                assert isinstance(background_attempt["before"], dict)
-                assert background_attempt["before"]["code"].get("complete") is True
-                assert background_attempt["before"]["code"].get("digest")
+                initial_start_pid = initial_start_event["server_pid"]
+                assert _registry_rows(registry_path) == rows_before
 
-        # stdio_client has now stopped the first MCP process; the detached local
-        # worker persists independently in A's remote-state directory.
         assert _reserved_job_id(registry_path) == job_id
 
-        # A second actual MCP process reuses the registry. It resumes locally,
-        # then switches to B before recovering the original job from saved A.
         async with stdio_client(params) as (reader, writer):
             async with ClientSession(reader, writer) as client:
                 await client.initialize()
                 before_resume_events = len(_events(event_log))
-                resumed, _ = await _call(client, "workspace_resume")
-                assert resumed["binding"]["workspace_id"]
+                resumed = await _call(client, "workspace_resume")
+                assert resumed["binding"]["workspace_id"] == workspace_id
                 assert resumed["remote_query_performed"] is False
-                assert resumed["job_collection_restarted"] is False
+                assert "last_test" not in resumed and "latest_test_attempt" not in resumed
                 assert len(_events(event_log)) == before_resume_events
 
-                bound_b, _ = await _call(client, "workspace_switch", {
+                bound_b = await _call(client, "workspace_switch", {
                     "host": "b", "cwd": str(source_b),
                 })
                 assert bound_b["target_id"] != target_a_id
 
-                # Reusing the key from B may be rejected because its target
-                # differs. Either way, it must never launch a second worker.
                 retry_raw = await client.call_tool("start_job", {
-                    "command": background_test_command,
+                    "command": background_command,
                     "idempotency_key": IDEMPOTENCY_KEY,
                 }, meta={"threadId": THREAD_ID})
-                if retry_raw.isError:
-                    retry = {}
-                else:
-                    retry = _value(retry_raw)
+                retry = {} if retry_raw.isError else _value(retry_raw)
                 assert retry_raw.isError or retry.get("deduplicated") or retry.get("error")
                 start_events = [e for e in _events(event_log) if e.get("op") == "job_start"]
                 assert len(start_events) == 1
 
-                before_resolve_events = len(_events(event_log))
-                recovered, _ = await _call(client, "resolve_operation", {
+                resolve_event_offset = len(_events(event_log))
+                recovered = await _call(client, "resolve_operation", {
                     "idempotency_key": IDEMPOTENCY_KEY,
                 })
                 assert recovered["job_id"] == job_id
                 assert recovered["target"]["target_id"] == target_a_id
-                assert recovered["execution_state"] == "running", recovered
-                assert recovered.get("local_job"), recovered
-                assert recovered["local_job"]["execution_state"] == "running"
+                assert recovered["target"]["host"] == "a"
+                assert recovered.get("local_job", {}).get("execution_state") == "running", recovered
+                assert "test_attempt" not in recovered and "test_observation" not in recovered
                 output_id = recovered["local_job"].get("job_output_id")
                 assert output_id
-                recovered_attempt = recovered.get("test_attempt")
-                assert recovered_attempt is not None
-                assert recovered_attempt["attempt_id"] == background_attempt_id
-                assert recovered_attempt["attempt_order"] == background_attempt["attempt_order"]
-                resolve_events = _events(event_log)[before_resolve_events:]
-                assert resolve_events, "recovery should contact the original target"
-                assert all(e["target"] == "simulated-a" for e in resolve_events), (
-                    "recovery must use A's saved target after switching to B; "
-                    f"events={resolve_events!r}"
-                )
-                assert all(e["server_pid"] != initial_start_event["server_pid"]
-                           for e in resolve_events), "recovery must run in a new MCP process"
-                assert len({e["server_pid"] for e in resolve_events}) == 1
+                resolve_events = _events(event_log)[resolve_event_offset:]
+                assert resolve_events
+                assert all(event["target"] == "simulated-a" for event in resolve_events)
+                assert all(event["server_pid"] != initial_start_pid for event in resolve_events)
+                assert len({event["server_pid"] for event in resolve_events}) == 1
 
-                # The worker is held outside both project trees. The real local
-                # collector must be attached and have received only a prefix.
-                local_record = await _wait_for_local_collector(
-                    state_dir, workspace_id, output_id, timeout=12, terminal=False)
+                local_record = await _wait_for_local_record(
+                    state_dir, workspace_id, output_id, timeout=12,
+                    marker="ORIGINAL_PROJECT_STARTED",
+                )
                 assert local_record["execution_state"] == "running"
                 assert Path(local_record["remote_job_dir"]) == expected_job_dir
-                partial, _ = await _call(client, "job_status", {
-                    "job_id": job_id, "stdout_cursor": 0, "stderr_cursor": 0,
-                    "max_bytes": 256,
-                })
-                assert partial["execution_state"] == "running", partial
-                assert partial["job_output_id"] == output_id
-                assert partial["stdout_has_more"] is True, partial
-                first_stdout_page = partial["stdout_tail"]
-                first_stderr_page = partial["stderr_tail"]
-                cursor_trace = [0, partial["next_stdout_cursor"]]
-                assert "ORIGINAL_PROJECT_STARTED" in first_stdout_page
-                assert "CURSOR_PREFIX_START" in first_stdout_page
-                assert partial["next_stdout_cursor"] > 0
-                verified_running_attempt = await _wait_for_attempt_state(
-                    registry_path, attempt_id=background_attempt_id,
-                    expected="running", timeout=8)
-
-                # Switch back to A only to run a newer, quick foreground test.
-                # Its order becomes the latest reliable observation while the
-                # older background job remains blocked and unresolved.
-                bound_a_again, _ = await _call(client, "workspace_switch", {
-                    "host": "a", "cwd": str(source_a),
-                })
-                assert bound_a_again["target_id"] == target_a_id
-                before_a_resume_events = len(_events(event_log))
-                a_resume_while_blocked, _ = await _call(client, "workspace_resume")
-                assert len(_events(event_log)) == before_a_resume_events
-                latest_while_blocked = a_resume_while_blocked.get("latest_test_attempt")
-                previous_while_blocked = a_resume_while_blocked.get("last_test")
-                assert latest_while_blocked["attempt_id"] == background_attempt_id
-                assert latest_while_blocked["state"] == "running"
-                assert latest_while_blocked["attempt_id"] == verified_running_attempt["attempt_id"]
-                assert previous_while_blocked["attempt_id"] == baseline_attempt["attempt_id"]
-                assert previous_while_blocked["attempt_order"] < latest_while_blocked["attempt_order"]
-                assert a_resume_while_blocked["remote_query_performed"] is False
-                assert previous_while_blocked["historical"] is True
-                assert previous_while_blocked["current_applicability"] == "unknown"
-                assert previous_while_blocked["applies_to_current_code"] is None
-
-                newer_test, _ = await _call(client, "exec_command", {
-                    "command": fast_test_command,
-                })
-                assert newer_test.get("exit_code") == 0, newer_test
-                newer_attempt = _latest_attempt_row(registry_path, workspace_id, target_a_id)
-                assert newer_attempt is not None
-                assert newer_attempt["execution_kind"] == "foreground"
-                assert newer_attempt["state"] == "finished"
-                assert newer_attempt["process_exit_status"] == "success"
-                assert newer_attempt["test_result"] == "success"
-                assert newer_attempt["attempt_order"] > background_attempt["attempt_order"]
-                latest_last_test = _last_test_row(registry_path, workspace_id, target_a_id)
-                assert latest_last_test["attempt_id"] == newer_attempt["attempt_id"]
-                assert latest_last_test["attempt_order"] == newer_attempt["attempt_order"]
-
-                # Return to B, demonstrate B has no A evidence, and only then
-                # release the gate. Resume remains local; snapshot is fresh.
-                bound_b_again, _ = await _call(client, "workspace_switch", {
-                    "host": "b", "cwd": str(source_b),
-                })
-                assert bound_b_again["target_id"] == bound_b["target_id"]
-                before_b_resume_events = len(_events(event_log))
-                b_resume, _ = await _call(client, "workspace_resume")
-                assert len(_events(event_log)) == before_b_resume_events
-                assert b_resume["remote_query_performed"] is False
-                assert b_resume.get("last_test") is None
-                assert b_resume.get("latest_test_attempt") is None
-                b_snapshot, _ = await _call(client, "workspace_snapshot")
-                assert b_snapshot.get("last_test") is None
-                assert b_snapshot.get("test_evidence_comparison") is None
-                assert release_gate.exists()
-                before_gate_release_events = len(_events(event_log))
-                release_gate.unlink()
-
-                # No job_status/job_wait call occurs between gate release and
-                # this direct local check: the collector itself must persist
-                # the background completion against its saved A attempt.
-                terminal_record = await _wait_for_local_collector(
-                    state_dir, workspace_id, output_id, timeout=20, terminal=True)
-                terminal_attempt = await _wait_for_test_attempt(
-                    registry_path, attempt_id=background_attempt_id, timeout=20)
-                collector_events = _events(event_log)[before_gate_release_events:]
-                assert collector_events, "collector should read A's finished output independently"
-                assert all(event["target"] == "simulated-a" for event in collector_events)
-                assert terminal_attempt["state"] == "finished"
-                assert terminal_attempt["process_exit_status"] == "success"
-                assert terminal_attempt["exit_code"] == 0
-                assert terminal_attempt["test_result"] == "success"
-                assert terminal_attempt["job_id"] == job_id
-                assert terminal_attempt["attempt_id"] == background_attempt_id
-                assert terminal_attempt["attempt_order"] == background_attempt["attempt_order"]
-                assert terminal_attempt["command"] == background_test_command
-                assert terminal_attempt["cwd"] == str(project_a)
-                assert terminal_attempt["target"]["target_id"] == target_a_id
-                assert terminal_attempt["target"]["host"] == "a"
-                assert terminal_attempt["target"]["source_cwd"] == str(source_a)
-                assert terminal_attempt["target"]["project_root"] == str(project_a)
-                assert terminal_attempt["before"]["code"].get("complete") is True
-                assert terminal_attempt["before"]["code"].get("digest")
-                assert terminal_attempt["after"]["code"].get("complete") is True
-                assert terminal_attempt["after"]["code"].get("digest")
-                assert terminal_attempt["summary"]["tests_run"] == 1
-                assert terminal_attempt["summary"]["reported_skips"] == 0
-                assert terminal_attempt["summary"]["executed"] == 1
-                assert terminal_attempt["summary"]["passed"] == 1
-                assert terminal_attempt["observation"]["summary_stream"] == "stderr"
-                assert terminal_attempt["output_id"] == output_id
-                assert terminal_record["execution_state"] == "finished"
-                assert terminal_record["sync_state"] == "complete"
-                assert Path(terminal_record["remote_job_dir"]) == expected_job_dir
-                last_after_late_finish = _last_test_row(registry_path, workspace_id, target_a_id)
-                assert last_after_late_finish["attempt_id"] == newer_attempt["attempt_id"]
-                assert last_after_late_finish["attempt_order"] == newer_attempt["attempt_order"]
-
-                # job_wait and job_status now resume from the already-read byte
-                # cursor, then page the completed output without duplication.
-                before_job_control_events = len(_events(event_log))
-                waited, _ = await _call(client, "job_wait", {
-                    "job_id": job_id, "wait_seconds": 1,
-                    "stdout_cursor": partial["next_stdout_cursor"],
-                    "stderr_cursor": partial["next_stderr_cursor"],
-                    "max_bytes": 256,
-                })
-                assert waited.get("error") is None, waited
-                assert waited.get("execution_state") == "finished", waited
-                assert waited.get("sync_state") == "complete", waited
-                assert waited.get("job_output_id") == output_id
-                assert waited.get("test_attempt", {}).get("attempt_id") == background_attempt_id
-                stdout_pages = [first_stdout_page, waited["stdout_tail"]]
-                stderr_pages = [first_stderr_page, waited["stderr_tail"]]
-                stdout_cursor = waited["next_stdout_cursor"]
-                stderr_cursor = waited["next_stderr_cursor"]
-                cursor_trace.append(stdout_cursor)
-                status = waited
-                for _ in range(12):
-                    if not status["stdout_has_more"] and not status["stderr_has_more"]:
-                        break
-                    status, _ = await _call(client, "job_status", {
-                        "job_id": job_id, "stdout_cursor": stdout_cursor,
-                        "stderr_cursor": stderr_cursor, "max_bytes": 256,
+                first_page = None
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline:
+                    first_page = await _call(client, "job_status", {
+                        "job_id": job_id, "stdout_cursor": 0, "stderr_cursor": 0,
+                        "max_bytes": 256,
                     })
-                    assert status.get("test_attempt", {}).get("attempt_id") == background_attempt_id
-                    stdout_pages.append(status["stdout_tail"])
-                    stderr_pages.append(status["stderr_tail"])
-                    stdout_cursor = status["next_stdout_cursor"]
-                    stderr_cursor = status["next_stderr_cursor"]
-                    cursor_trace.append(stdout_cursor)
-                assert not status["stdout_has_more"] and not status["stderr_has_more"], status
-                assert all(left < right for left, right in zip(cursor_trace, cursor_trace[1:]))
-                captured_stdout = "".join(stdout_pages)
-                captured_stderr = "".join(stderr_pages)
-                assert captured_stdout.count("ORIGINAL_PROJECT_STARTED") == 1
-                assert captured_stdout.count("ORIGINAL_PROJECT_RESULT") == 1
-                assert captured_stdout.count("CURSOR_PREFIX_START") == 1
-                assert captured_stdout.count("CURSOR_PREFIX_END") == 1
-                assert captured_stdout.count("CURSOR_PAYLOAD_START") == 1
-                assert captured_stdout.count("x" * 400) == 1
-                assert captured_stderr.count("Ran 1 test") == 1
-                assert captured_stderr.rstrip().endswith("OK")
-                repeated, _ = await _call(client, "job_status", {
-                    "job_id": job_id, "stdout_cursor": stdout_cursor,
-                    "stderr_cursor": stderr_cursor, "max_bytes": 256,
-                })
-                assert repeated["stdout_tail"] == repeated["stderr_tail"] == ""
-                assert repeated["next_stdout_cursor"] == stdout_cursor
-                assert repeated["next_stderr_cursor"] == stderr_cursor
+                    if "CURSOR_PREFIX_START" in first_page.get("stdout_tail", ""):
+                        break
+                    await asyncio.sleep(0.05)
+                assert first_page is not None
+                assert first_page["execution_state"] == "running", first_page
+                assert first_page["job_output_id"] == output_id
+                assert first_page["stdout_has_more"] is True
+                assert "ORIGINAL_PROJECT_STARTED" in first_page["stdout_tail"]
+                assert "CURSOR_PREFIX_START" in first_page["stdout_tail"]
+                assert "CURSOR_PREFIX_END" not in first_page["stdout_tail"]
+                assert first_page["next_stdout_cursor"] > 0
 
-                stopped, _ = await _call(client, "stop_job", {"job_id": job_id})
-                assert stopped.get("cancel_requested") is False
-                assert stopped.get("execution_state") == "finished"
-                assert Path(stopped["task_dir"]) == expected_job_dir
-                job_control_events = _events(event_log)[before_job_control_events:]
+                waited_while_held = await _call(client, "job_wait", {
+                    "job_id": job_id, "wait_seconds": 0.2,
+                    "stdout_cursor": first_page["next_stdout_cursor"],
+                    "stderr_cursor": first_page["next_stderr_cursor"], "max_bytes": 256,
+                })
+                assert waited_while_held["job_id"] == job_id
+                assert "CURSOR_PREFIX_START" not in waited_while_held.get("stdout_tail", "")
+                second_page = await _call(client, "job_status", {
+                    "job_id": job_id,
+                    "stdout_cursor": first_page["next_stdout_cursor"],
+                    "stderr_cursor": first_page["next_stderr_cursor"], "max_bytes": 256,
+                })
+                assert second_page["job_output_id"] == output_id
+                assert second_page["next_stdout_cursor"] > first_page["next_stdout_cursor"]
+                assert "CURSOR_PREFIX_START" not in second_page.get("stdout_tail", "")
+
+                count_lines = launch_counter.read_text(encoding="utf-8").splitlines()
+                assert count_lines == ["A"], count_lines
+                stop_event_offset = len(_events(event_log))
+                stopped = await _call(client, "stop_job", {"job_id": job_id})
+                assert stopped.get("cancel_requested") is True, stopped
+                stop_requested = True
+                # stop_job flattens the worker's remote_task fields into its result.
+                stopped_remote_task = stopped
+                assert stopped_remote_task.get("state") == "finished", stopped_remote_task
+                assert stopped_remote_task.get("reason") == "cancelled", stopped_remote_task
+                assert stopped_remote_task.get("exit_code") == 130, stopped_remote_task
+                assert stopped_remote_task.get("cleanup_state") == "process_group_signalled"
+                assert stopped_remote_task.get("tree_confirmed") is False
+                stop_terminal_confirmed = True
+                stop_cleanup_confirmed = stopped_remote_task.get("tree_confirmed") is True
+                assert stopped.get("output_id")
+                stop_audit = await _call(client, "audit_get", {
+                    "operation_id": stopped["output_id"],
+                })
+                assert stop_audit["host"] == "simulated-a"
+                assert stop_audit["command"] == f"stop jobs/{job_id}"
+                stop_call_events = _events(event_log)[stop_event_offset:]
+                assert stop_call_events and all(
+                    event["target"] == "simulated-a" for event in stop_call_events
+                )
+                stop_events = [event for event in _events(event_log)
+                               if event.get("op") == "cancel_task" and event.get("job_id") == job_id]
+                assert stop_events and all(event["target"] == "simulated-a" for event in stop_events)
+
+                release_gate.unlink(missing_ok=True)
+                release_gate_removed = True
+                waited_after_stop = await _call(client, "job_wait", {
+                    "job_id": job_id, "wait_seconds": 8,
+                    "stdout_cursor": second_page["next_stdout_cursor"],
+                    "stderr_cursor": second_page["next_stderr_cursor"], "max_bytes": 1024,
+                })
+                assert waited_after_stop["job_id"] == job_id
+                assert waited_after_stop["job_output_id"] == output_id
+                assert "test_attempt" not in waited_after_stop
+                terminal_wait_state = waited_after_stop.get("execution_state")
+                terminal_states = {"finished", "failed", "cancelled", "timed_out"}
+                collector_wait_outcome = (
+                    "confirmed_terminal" if terminal_wait_state in terminal_states else "progress_or_wait_ended"
+                )
+                terminal_record = await _wait_for_local_terminal_record(
+                    state_dir, workspace_id, output_id, timeout=12,
+                )
+                assert terminal_record["execution_state"] in terminal_states, terminal_record
+                assert terminal_record["exit_code"] == stopped_remote_task["exit_code"]
+                final_status = await _call(client, "job_status", {
+                    "job_id": job_id,
+                    "stdout_cursor": terminal_record.get("stdout_bytes", 0),
+                    "stderr_cursor": terminal_record.get("stderr_bytes", 0), "max_bytes": 1024,
+                })
+                assert final_status["job_output_id"] == output_id
+                final_status_state = final_status.get("execution_state")
+                assert final_status_state in terminal_states, final_status
+                assert final_status.get("sync_state") == "complete", final_status
+                assert final_status.get("exit_code") == stopped_remote_task["exit_code"]
+                collector_final_outcome = "confirmed_terminal"
+                assert "ORIGINAL_PROJECT_STARTED" not in final_status.get("stdout_tail", "")
+
+                output_audit = await _call(client, "audit_get", {"operation_id": output_id})
+                assert output_audit["id"] == output_id and output_audit["job_id"] == job_id
+                saved_job_stdout = await _call(client, "read_output", {
+                    "output_id": output_id, "stream": "stdout",
+                })
+                saved_job_stderr = await _call(client, "read_output", {
+                    "output_id": output_id, "stream": "stderr",
+                })
+                assert "ORIGINAL_PROJECT_STARTED" in saved_job_stdout["content"]
+                assert "test_background_result" in saved_job_stderr["content"]
+
+                assert _registry_rows(registry_path) == rows_before
+                fingerprint_events = [event for event in _events(event_log)
+                                      if event.get("op") == "fingerprint"]
+                assert fingerprint_events == []
+                start_events = [event for event in _events(event_log) if event.get("op") == "job_start"]
+                assert len(start_events) == 1 and start_events[0]["target"] == "simulated-a"
+                job_control_events = [event for event in _events(event_log)
+                                      if event.get("op") in {"job_status", "cancel_task", "job_log_follow"}
+                                      and event.get("job_id") == job_id]
                 assert job_control_events
                 assert all(event["target"] == "simulated-a" for event in job_control_events)
-                completed = True
-
-                # Resume A as local history, then explicitly take a fresh
-                # snapshot to judge code applicability. Environment remains
-                # unverified even when the bounded content fingerprint matches.
-                bound_a_final, _ = await _call(client, "workspace_switch", {
-                    "host": "a", "cwd": str(source_a),
+                _write_acceptance_evidence(evidence_dir, "phase1-stdio-evidence.json", {
+                    "thread_id": THREAD_ID,
+                    "workspace_id": workspace_id,
+                    "target_a_id": target_a_id,
+                    "job_id": job_id,
+                    "job_output_id": output_id,
+                    "dropped_successful_start_ack": True,
+                    "new_mcp_process_pid": sorted({event["server_pid"] for event in resolve_events}),
+                    "start_request_count": len(start_events),
+                    "launch_count": count_lines,
+                    "default_fingerprint_calls": len(fingerprint_events),
+                    "legacy_rows_unchanged": True,
+                    "stop_requested": stop_requested,
+                    "remote_terminal_confirmed": stop_terminal_confirmed,
+                    "remote_terminal_reason": stopped_remote_task["reason"],
+                    "remote_terminal_exit_code": stopped_remote_task["exit_code"],
+                    "remote_cleanup_state": stopped_remote_task["cleanup_state"],
+                    "process_tree_confirmed": stopped_remote_task["tree_confirmed"],
+                    "collector_terminal_sync_state": terminal_record["sync_state"],
+                    "collector_terminal_state": terminal_wait_state,
+                    "collector_wait_outcome": collector_wait_outcome,
+                    "collector_final_state": final_status_state,
+                    "collector_final_outcome": collector_final_outcome,
+                    "partial_cursors": [0, first_page["next_stdout_cursor"],
+                                        second_page["next_stdout_cursor"]],
+                    "control_events_target": sorted({event["target"] for event in job_control_events}),
+                    "ssh_events": _events(event_log),
                 })
-                assert bound_a_final["target_id"] == target_a_id
-                final_resume_events = len(_events(event_log))
-                final_resume, _ = await _call(client, "workspace_resume")
-                assert len(_events(event_log)) == final_resume_events
-                final_latest_attempt = final_resume["latest_test_attempt"]
-                final_last_test = final_resume["last_test"]
-                assert final_latest_attempt["attempt_id"] == newer_attempt["attempt_id"]
-                assert final_latest_attempt["attempt_order"] == newer_attempt["attempt_order"]
-                assert final_latest_attempt["cache_freshness"] == "unknown"
-                assert final_last_test["attempt_id"] == newer_attempt["attempt_id"]
-                assert final_last_test["attempt_order"] == newer_attempt["attempt_order"]
-                assert final_last_test["historical"] is True
-                assert final_last_test["current_applicability"] == "unknown"
-                assert final_last_test["applies_to_current_code"] is None
-                assert final_last_test["current_code_checked"] is False
-                assert final_last_test["environment_limit"]
-                assert final_last_test["environment_verified_current"] is False
-
-                fresh_snapshot, _ = await _call(client, "workspace_snapshot")
-                fresh_last_test = fresh_snapshot["last_test"]
-                fresh_latest_attempt = fresh_snapshot["latest_test_attempt"]
-                assert fresh_latest_attempt["attempt_id"] == newer_attempt["attempt_id"]
-                assert fresh_latest_attempt["attempt_order"] == newer_attempt["attempt_order"]
-                assert fresh_latest_attempt["cache_freshness"] == "unknown"
-                assert fresh_latest_attempt["applies_to_current_code"] is True
-                assert fresh_latest_attempt["current_applicability"] == "current"
-                assert fresh_latest_attempt["historical"] is False
-                assert fresh_latest_attempt["test_execution_is_historical"] is True
-                assert fresh_latest_attempt["environment_verified_current"] is False
-                assert fresh_last_test["attempt_id"] == newer_attempt["attempt_id"]
-                assert fresh_last_test["attempt_order"] == newer_attempt["attempt_order"]
-                assert fresh_last_test["applies_to_current_code"] is True
-                assert fresh_last_test["historical"] is False
-                assert fresh_last_test["test_execution_is_historical"] is True
-                assert fresh_last_test["current_code_checked"] is True
-                assert fresh_last_test["environment_verified_current"] is False
-                assert fresh_last_test["environment_limit"]
-
-                start_events = [e for e in _events(event_log) if e.get("op") == "job_start"]
-                assert len(start_events) == 1
-                assert launch_counter.read_text().splitlines() == ["A"]
-                assert len([e for e in _events(dropped_log) if e["op"] == "job_start"]) == 1
-                _write_acceptance_evidence(evidence_dir, "d3-stdio-evidence.json", {
-                    "classification": "real MCP stdio subprocesses; test-only simulated SSH; real local worker; no live SSH, real server, or App-loaded claim",
-                    "fault": {
-                        "dropped_success_reply_after_persist": True,
-                        "job_id": job_id,
-                        "job_dir": dropped[0]["job_dir"],
-                        "worker_status_and_origin_existed": True,
-                    },
-                    "mcp_server_pids": [
-                        initial_start_event["server_pid"], resolve_events[0]["server_pid"],
-                    ],
-                    "target_recovery": {
-                        "original_target_id": target_a_id,
-                        "original_ssh_target": "simulated-a",
-                        "current_target_during_recovery": bound_b["target_id"],
-                        "current_target_during_completion": bound_b_again["target_id"],
-                        "current_ssh_target_during_completion": "simulated-b",
-                        "recovered_target_id": recovered["target"]["target_id"],
-                        "recovered_target_host": recovered["target"]["host"],
-                    },
-                    "worker_launches": {
-                        "job_start_requests": len(start_events),
-                        "command_counter_lines": launch_counter.read_text().splitlines(),
-                        "b_project_launch_absent": "B" not in launch_counter.read_text().splitlines(),
-                    },
-                    "test_attempts": {
-                        "baseline": {
-                            "attempt_id": baseline_attempt["attempt_id"],
-                            "attempt_order": baseline_attempt["attempt_order"],
-                            "state": baseline_attempt["state"],
-                            "test_result": baseline_attempt["test_result"],
-                        },
-                        "background": {
-                            "attempt_id": terminal_attempt["attempt_id"],
-                            "attempt_order": terminal_attempt["attempt_order"],
-                            "job_id": terminal_attempt["job_id"],
-                            "state": terminal_attempt["state"],
-                            "process_exit_status": terminal_attempt["process_exit_status"],
-                            "exit_code": terminal_attempt["exit_code"],
-                            "test_result": terminal_attempt["test_result"],
-                            "command": terminal_attempt["command"],
-                            "cwd": terminal_attempt["cwd"],
-                            "target": terminal_attempt["target"],
-                            "before": terminal_attempt["before"],
-                            "after": terminal_attempt["after"],
-                            "summary": terminal_attempt["summary"],
-                            "summary_stream": terminal_attempt["observation"]["summary_stream"],
-                            "output_id": terminal_attempt["output_id"],
-                        },
-                        "newer_foreground": {
-                            "attempt_id": newer_attempt["attempt_id"],
-                            "attempt_order": newer_attempt["attempt_order"],
-                            "state": newer_attempt["state"],
-                            "test_result": newer_attempt["test_result"],
-                        },
-                        "late_background_did_not_replace_latest_reliable": {
-                            "latest_attempt_id": final_latest_attempt["attempt_id"],
-                            "last_test_attempt_id": final_last_test["attempt_id"],
-                            "expected_newer_attempt_id": newer_attempt["attempt_id"],
-                            "background_order": terminal_attempt["attempt_order"],
-                            "reliable_order": final_last_test["attempt_order"],
-                        },
-                    },
-                    "handles": {
-                        "job_id": job_id,
-                        "job_output_id": output_id,
-                        "execution_state": status["execution_state"],
-                        "sync_state": waited.get("sync_state"),
-                        "stop_result_state": stopped["execution_state"],
-                    },
-                    "output_paging": {
-                        "cursor_trace": cursor_trace,
-                        "stdout_pages": len(stdout_pages),
-                        "marker_counts": {
-                            name: captured_stdout.count(name) for name in (
-                                "ORIGINAL_PROJECT_STARTED", "ORIGINAL_PROJECT_RESULT",
-                                "CURSOR_PREFIX_START", "CURSOR_PREFIX_END", "CURSOR_PAYLOAD_START",
-                            )
-                        },
-                        "complete_unittest_summary_present": (
-                            ("Ran 1 test" in captured_stdout and "OK" in captured_stdout) or
-                            ("Ran 1 test" in captured_stderr and captured_stderr.rstrip().endswith("OK"))
-                        ),
-                        "stderr_bytes_returned": len(captured_stderr.encode("utf-8")),
-                        "final_page_empty": repeated["stdout_tail"] == repeated["stderr_tail"] == "",
-                    },
-                    "applicability": {
-                        "resume_historical": {
-                            "applies_to_current_code": final_last_test["applies_to_current_code"],
-                            "current_applicability": final_last_test["current_applicability"],
-                            "historical": final_last_test["historical"],
-                            "environment_limit": final_last_test["environment_limit"],
-                        },
-                        "fresh_snapshot": {
-                            "attempt_id": fresh_last_test["attempt_id"],
-                            "attempt_order": fresh_last_test["attempt_order"],
-                            "applies_to_current_code": fresh_last_test["applies_to_current_code"],
-                            "environment_verified_current": fresh_last_test["environment_verified_current"],
-                            "environment_limit": fresh_last_test["environment_limit"],
-                        },
-                        "b_snapshot_has_no_a_test_evidence": b_snapshot.get("last_test") is None,
-                    },
-                    "collector_terminal_record": {
-                        "execution_state": terminal_record["execution_state"],
-                        "sync_state": terminal_record["sync_state"],
-                        "remote_job_dir": terminal_record["remote_job_dir"],
-                        "verified_before_any_terminal_mcp_poll": True,
-                        "post_release_ssh_targets": sorted({
-                            event["target"] for event in collector_events
-                        }),
-                    },
-                    "ssh_events": [
-                        {key: event.get(key) for key in ("target", "op", "job_id", "server_pid", "dropped")}
-                        for event in _events(event_log)
-                    ],
-                })
-
-        assert launch_counter.read_text().splitlines() == ["A"]
     finally:
-        # Always release the external gate before cleanup so a failure cannot
-        # strand the local worker. Stop only this test's exact known job ID.
-        release_gate.unlink(missing_ok=True)
-        job_id = job_id or _reserved_job_id(registry_path)
-        if job_id and not completed:
-            async def cleanup_job():
-                async with stdio_client(params) as (reader, writer):
-                    async with ClientSession(reader, writer) as client:
-                        await client.initialize()
-                        await _call(client, "stop_job", {"job_id": job_id})
+        if not release_gate_removed:
+            release_gate.unlink(missing_ok=True)
+        final_cleanup = None
+        if job_id and not stop_cleanup_confirmed:
             try:
-                await asyncio.wait_for(cleanup_job(), timeout=12)
+                async with stdio_client(params) as (reader, writer):
+                    async with ClientSession(reader, writer) as cleanup_client:
+                        await cleanup_client.initialize()
+                        final_cleanup = await asyncio.wait_for(
+                            _call(cleanup_client, "stop_job", {"job_id": job_id}), timeout=10)
             except Exception:
-                # The gate is already released and the configured job timeout
-                # is bounded; don't mask the original assertion failure.
-                pass
+                final_cleanup = {"execution_state": "unknown", "cleanup_attempted": True}
+        evidence_path = evidence_dir / "phase1-stdio-evidence.json"
+        if evidence_path.is_file():
+            evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+            evidence["finally_gate_released"] = not release_gate.exists()
+            evidence["finally_cleanup_attempted"] = bool(job_id and not stop_cleanup_confirmed)
+            if isinstance(final_cleanup, dict):
+                cleanup_task = final_cleanup.get("remote_task")
+                if not isinstance(cleanup_task, dict):
+                    cleanup_task = final_cleanup
+                evidence["finally_cleanup_outcome"] = {
+                    key: cleanup_task.get(key) for key in (
+                        "execution_state", "state", "reason", "exit_code",
+                        "cleanup_state", "tree_confirmed", "cancel_requested",
+                    )
+                }
+            else:
+                evidence["finally_cleanup_outcome"] = None
+            evidence["ssh_events"] = _events(event_log)
+            _write_acceptance_evidence(evidence_dir, "phase1-stdio-evidence.json", evidence)

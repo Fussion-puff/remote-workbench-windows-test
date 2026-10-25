@@ -1,7 +1,8 @@
-"""Conservative test observations tied to content, command and configuration.
+"""Legacy offline helpers for reading or exercising historical test evidence.
 
-A file digest does not certify installed dependencies or an environment activated
-inside an arbitrary shell command. Those remain explicitly unmeasured.
+The normal session execution and background collection paths do not import or
+call this module. A file digest does not certify installed dependencies or an
+environment activated inside an arbitrary shell command.
 """
 from __future__ import annotations
 

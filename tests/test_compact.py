@@ -58,6 +58,7 @@ def test_large_success_uses_full_spool_but_keeps_unknown_output(tmp_path):
         original = result(truncated=True, output_id=output_id, stderr="head/tail preview")
         value = compact_result("exec_command", original, {"command": "python3 -m unittest -v"})
         assert value["test_summary"]["tests"] == 100
+        assert value["truncated"] is True
         assert (path / "stderr").read_text() == text
         (path / "stderr").write_text("ResourceWarning: do not hide this\n" + text)
         assert "test_summary" not in compact_result("exec_command", original, {"command": "python3 -m unittest -v"})
@@ -176,8 +177,7 @@ def test_normal_cleanup_limits_remain_explicit_without_repeating_origin():
     assert value["remote_task"]["hard_process_limit"] is False
     assert value["remote_task"]["future_cleanup_field"] == "keep"
     assert "pgid" not in value["remote_task"]
-    assert value["test_evidence"]["environment_verified"] is False
-    assert value["test_evidence"]["future_evidence"] == "keep"
+    assert value["test_evidence"] == source["test_evidence"]
     failed = compact_result("exec_command", dict(source, exit_code=1))
     assert failed["remote_task"]["pgid"] == 123
 

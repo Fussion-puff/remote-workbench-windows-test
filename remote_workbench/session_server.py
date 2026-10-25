@@ -24,10 +24,9 @@ from remote_workbench.session_context import get_codex_identity, request_metadat
 from remote_workbench.workspace import TOOLS, bind_tool, _local_audit_viewer
 from remote_workbench.workspace_router import SessionRouter, default_state_dir
 from remote_workbench.workspace_registry import WorkspaceTarget
-from remote_workbench.presentation import is_test_command
 from remote_workbench.workspace_snapshot import collect as collect_snapshot
-from remote_workbench.compute_review import REVIEW_INSTRUCTIONS, check_compute_review
-from remote_workbench import baseline, test_evidence
+from remote_workbench.compute_review import REVIEW_INSTRUCTIONS
+from remote_workbench import baseline
 from remote_workbench.auth_boundary import authentication_command, refusal
 from remote_workbench.compact import COMPACT_INSTRUCTIONS, COMPACT_TOOLS, compact_result
 
@@ -37,13 +36,6 @@ _JOB_CONTROL_TOOLS = {"job_status", "stop_job", "job_wait"}
 # command owns the workspace lease. Remote checks may observe intermediate
 # files while a command is running; they never mutate the workspace.
 _READ_ONLY_REMOTE_TOOLS = {"workspace_snapshot", "workspace_changes", "workspace_preview", "fetch_image"}
-_EVIDENCE_INVALIDATING_TOOLS = {
-    # Shell commands are opaque: wrappers, aliases and scripts make a command
-    # name allowlist too weak to establish that an exec was read-only.
-    "exec_command", "write_file", "patch_file", "apply_patch",
-    # Background work may edit the saved target while it runs or is stopped.
-    "start_job", "stop_job",
-}
 _SESSION_LOCAL_TOOLS = {"workspace_resume", "workspace_note"}
 _UNLOCKED_TOOLS = _LOCAL_TOOLS | _JOB_CONTROL_TOOLS | {
     "workspace_info", "workspace_history", "resolve_operation"
@@ -53,8 +45,7 @@ _BUDGETS = {"exec_command": 2048, "read_file": 4096, "patch_file": 4096,
 
 
 def _job_origin_record(target, job_id, *, origin_nonce, launch_cwd, remote_state_dir,
-                      ssh_target, actual_cwd=None, test_attempt_id=None,
-                      registry_path=None):
+                      ssh_target, actual_cwd=None):
     return {
         "workspace_id": target.workspace_id,
         "job_id": job_id,
@@ -68,8 +59,6 @@ def _job_origin_record(target, job_id, *, origin_nonce, launch_cwd, remote_state
         "remote_state_dir": remote_state_dir,
         "ssh_target": ssh_target,
         "actual_cwd": actual_cwd,
-        "test_attempt_id": test_attempt_id,
-        "registry_path": registry_path,
     }
 
 
@@ -97,29 +86,6 @@ def _public_test_attempt(attempt, *, applicability=None, historical=True):
                                "current" if applicability is True else "historical"),
         environment_verified_current=False,
         environment_limit="Activated shell environment, installed dependencies and external inputs were not fingerprinted.",
-    )
-    return value
-
-
-def _public_test_observation(observation):
-    if not isinstance(observation, dict):
-        return None
-    value = dict(observation)
-    command = value.pop("command", None)
-    if isinstance(command, str):
-        value["command_preview"] = command[:240] + ("…" if len(command) > 240 else "")
-    value.pop("observation", None)
-    # Job controls and resolve_operation are historical reads. The stored
-    # after fingerprint remains immutable, but only a fresh workspace_snapshot
-    # may compare it with the current target.
-    value.update(
-        applies_to_current_code=None,
-        historical=True,
-        test_execution_is_historical=True,
-        current_code_checked=False,
-        current_applicability="unknown",
-        cache_freshness="unknown",
-        environment_verified_current=False,
     )
     return value
 
@@ -190,14 +156,6 @@ def create_server(router: SessionRouter, *, viewer_url: str | None = None,
     def workspace_url(state):
         return f"{viewer_url}/w/{state.workspace_id}/" if viewer_url else None
 
-    def invalidate_test_cache(workspace_id, target_id, operation):
-        if not target_id:
-            return
-        previous = router.registry.last_test(workspace_id, target_id)
-        if previous is not None:
-            router.registry.save_test(
-                workspace_id, target_id, test_evidence.invalidate(previous, operation))
-
     def pack(result, state, name=None, arguments=None):
         result = dict(result)
         if tool_profile == "compact":
@@ -230,12 +188,15 @@ def create_server(router: SessionRouter, *, viewer_url: str | None = None,
     async def history(state, identity, limit: int = 20):
         return {"targets": router.registry.history(state.workspace_id, limit)}
 
-    async def resume(state, identity, job_offset: int = 0, limit: int = 20):
-        """Build a local-only recovery summary; never reconnect or poll SSH."""
+    async def resume(state, identity, job_offset: int = 0, limit: int = 20,
+                     include_legacy_test_history: bool = False):
+        """Build a local-only recovery summary; legacy test history is opt-in."""
         if isinstance(job_offset, bool) or not isinstance(job_offset, int) or job_offset < 0:
             raise ValueError("job_offset must be a non-negative integer")
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 50:
             raise ValueError("limit must be between 1 and 50")
+        if not isinstance(include_legacy_test_history, bool):
+            raise ValueError("include_legacy_test_history must be a boolean")
         recent_delivery = []
         for item in audit.recent(limit=100):
             if item.get("tool") not in {"workspace_changes", "workspace_preview", "workspace_apply"}:
@@ -299,48 +260,53 @@ def create_server(router: SessionRouter, *, viewer_url: str | None = None,
                 "local_cache_age": "unknown",
                 "lookup_error": lookup_error,
             })
-        current_test = (router.registry.last_test(state.workspace_id, state.target_id)
-                        if state.target_id else None)
-        latest_attempt = (router.registry.latest_test_attempt(state.workspace_id, state.target_id)
-                          if state.target_id else None)
-        latest_attempt = _public_test_attempt(latest_attempt, applicability=None, historical=True)
-        if isinstance(current_test, dict):
-            current_test = dict(current_test)
-            # Resume only reads the local registry. Its cached test result is
-            # useful history, never proof about the code currently on the host.
-            current_test.update(
-                applies_to_current_code=None,
-                historical=True,
-                test_execution_is_historical=True,
-                current_code_checked=False,
-                current_applicability="unknown",
-                cache_freshness="unknown",
-                environment_verified_current=False,
-            )
-            command = current_test.pop("command", None)
-            if isinstance(command, str):
-                current_test["command_preview"] = command[:240] + ("…" if len(command) > 240 else "")
-            current_test["local_record_id"] = (
-                current_test.get("operation_id") or current_test.get("output_id")
-            )
-            for field in ("before", "after"):
-                evidence = current_test.get(field)
-                if not isinstance(evidence, dict):
-                    continue
-                code = evidence.get("code")
-                current_test[field] = {
-                    "code": ({
-                        key: code[key] for key in ("complete", "digest", "scope", "files", "bytes", "reason")
-                        if key in code
-                    } if isinstance(code, dict) else None),
-                    "config_digest": evidence.get("config_digest"),
-                    "observed_at": evidence.get("observed_at"),
-                }
-        return {
+        legacy_test_history = None
+        if include_legacy_test_history:
+            current_test = (router.registry.last_test(state.workspace_id, state.target_id)
+                            if state.target_id else None)
+            latest_attempt = (router.registry.latest_test_attempt(state.workspace_id, state.target_id)
+                              if state.target_id else None)
+            latest_attempt = _public_test_attempt(latest_attempt, applicability=None, historical=True)
+            if isinstance(current_test, dict):
+                current_test = dict(current_test)
+                # Explicit legacy reads are historical only; never rewrite the stored row.
+                current_test.update(
+                    applies_to_current_code=None,
+                    historical=True,
+                    test_execution_is_historical=True,
+                    current_code_checked=False,
+                    current_applicability="unknown",
+                    cache_freshness="unknown",
+                    environment_verified_current=False,
+                )
+                command = current_test.pop("command", None)
+                if isinstance(command, str):
+                    current_test["command_preview"] = command[:240] + ("…" if len(command) > 240 else "")
+                current_test["local_record_id"] = (
+                    current_test.get("operation_id") or current_test.get("output_id")
+                )
+                for field in ("before", "after"):
+                    evidence = current_test.get(field)
+                    if not isinstance(evidence, dict):
+                        continue
+                    code = evidence.get("code")
+                    current_test[field] = {
+                        "code": ({
+                            key: code[key] for key in ("complete", "digest", "scope", "files", "bytes", "reason")
+                            if key in code
+                        } if isinstance(code, dict) else None),
+                        "config_digest": evidence.get("config_digest"),
+                        "observed_at": evidence.get("observed_at"),
+                    }
+            legacy_test_history = {
+                "last_test": current_test,
+                "latest_test_attempt": latest_attempt,
+                "applicability": "unknown",
+                "source": "local_legacy_history",
+            }
+        result = {
             "binding": dict(asdict(state), mode="remote" if state.host is not None else "local"),
             "recent_bindings": router.registry.history(state.workspace_id, 10),
-            "last_test": current_test,
-            "latest_test_attempt": latest_attempt,
             "jobs": jobs,
             "jobs_offset": job_offset,
             "jobs_limit": limit,
@@ -354,6 +320,9 @@ def create_server(router: SessionRouter, *, viewer_url: str | None = None,
             "job_collection_restarted": False,
             "local_cache_freshness": "unknown; no remote status query was made",
         }
+        if legacy_test_history is not None:
+            result["legacy_test_history"] = legacy_test_history
+        return result
 
     async def note(state, identity, goal: str | None = None, constraints: str | None = None,
                    decisions: str | None = None, next_step: str | None = None):
@@ -419,9 +388,6 @@ def create_server(router: SessionRouter, *, viewer_url: str | None = None,
                     for key in ("baseline_state", "source_state", "session_state"):
                         item.pop(key, None)
             else:
-                # Applying a preview writes to the original source tree. It is
-                # conservatively treated as a possible change to this target.
-                invalidate_test_cache(state.workspace_id, snapshot.target_id, "workspace_apply")
                 result = await baseline.apply_delivery(
                     snapshot.workspace.executor, snapshot.project_root, arguments["files"])
             audit.update(record, status="failed" if result.get("error") else "finished",
@@ -440,7 +406,6 @@ def create_server(router: SessionRouter, *, viewer_url: str | None = None,
         operation = router.registry.get_job_operation(state.workspace_id, idempotency_key)
         local_job = None
         local_job_error = None
-        attempt = router.registry.test_attempt_for_job(state.workspace_id, operation.job_id)
         if operation.target.host not in router.config.hosts:
             local_job_error = "origin_host_not_configured"
         elif not operation.target.cwd:
@@ -456,18 +421,14 @@ def create_server(router: SessionRouter, *, viewer_url: str | None = None,
                     remote_state_dir=operation.remote_state_dir,
                     ssh_target=operation.ssh_target,
                     actual_cwd=operation.actual_cwd,
-                    test_attempt_id=operation.test_attempt_id,
-                    registry_path=str(router.registry.path),
                 )
                 # resolve_operation may be called while the thread is bound
                 # to another target. Handle/audit creation and collector tasks
                 # must inherit the saved job's identity, never the current B
                 # binding, while leaving that active binding untouched.
-                saved_revision = (attempt.get("workspace_revision", state.revision)
-                                  if isinstance(attempt, dict) else state.revision)
                 with audit.scoped_metadata(
                         thread_id=state.thread_id, workspace_id=state.workspace_id,
-                        revision=saved_revision, target_id=operation.target.target_id,
+                        revision=state.revision, target_id=operation.target.target_id,
                         client_session_id=identity.session_id):
                     local_job = await job_collector.ensure(executor, operation.job_id, origin=origin)
                     if (isinstance(local_job, dict) and local_job.get("job_output_id") and
@@ -477,8 +438,6 @@ def create_server(router: SessionRouter, *, viewer_url: str | None = None,
                             state.workspace_id, operation.job_id, local_job["actual_cwd"])
             except (OSError, ValueError, sqlite3.Error, RuntimeError) as exc:
                 local_job_error = "origin_recovery_unavailable: " + str(exc)
-        # The collector may have persisted a terminal event during ensure().
-        attempt = router.registry.test_attempt_for_job(state.workspace_id, operation.job_id)
         result = {
             "idempotency_key": operation.idempotency_key,
             "operation_state": operation.state,
@@ -499,10 +458,6 @@ def create_server(router: SessionRouter, *, viewer_url: str | None = None,
         if local_job_error:
             result["local_job_state"] = "unavailable"
             result["state_reason"] = local_job_error
-        if attempt is not None:
-            result["test_attempt"] = _public_test_attempt(attempt, applicability=None, historical=True)
-            if isinstance(attempt.get("observation"), dict):
-                result["test_observation"] = _public_test_observation(attempt["observation"])
         if operation.state in {"reserved", "unknown"}:
             result["warning"] = (
                 "Submission may have reached the remote worker. Do not restart it under a new key "
@@ -510,27 +465,31 @@ def create_server(router: SessionRouter, *, viewer_url: str | None = None,
             )
         return result
 
-    async def workspace_snapshot(state, identity):
+    async def workspace_snapshot(state, identity, scan_content: bool = False,
+                                 max_files: int = 10000,
+                                 max_content_bytes: int = 67108864):
+        if not isinstance(scan_content, bool):
+            raise ValueError("scan_content must be a boolean")
+        if (isinstance(max_files, bool) or not isinstance(max_files, int)
+                or not 1 <= max_files <= 100000):
+            raise ValueError("max_files must be between 1 and 100000")
+        if (isinstance(max_content_bytes, bool) or not isinstance(max_content_bytes, int)
+                or not 1 <= max_content_bytes <= 1073741824):
+            raise ValueError("max_content_bytes must be between 1 and 1073741824")
         snapshot = router.snapshot(state)
         record = audit.create(kind="tool", tool="workspace_snapshot", host=snapshot.host,
                               cwd=snapshot.cwd, status="running")
         token = audit.operation_id.set(record)
         try:
             result = await collect_snapshot(snapshot)
-            current = await test_evidence.capture(snapshot)
-            comparison = test_evidence.compare(
-                router.registry.last_test(state.workspace_id, snapshot.target_id), current)
-            latest_attempt = router.registry.latest_test_attempt(state.workspace_id, snapshot.target_id)
-            attempt_applicability = None
-            if isinstance(latest_attempt, dict) and isinstance(latest_attempt.get("observation"), dict):
-                attempt_comparison = test_evidence.compare(latest_attempt["observation"], current)
-                attempt_applicability = (attempt_comparison.get("applies_to_current_code")
-                                         if isinstance(attempt_comparison, dict) else None)
-            result["content_fingerprint"] = current["code"]
-            result["test_evidence_comparison"] = comparison
-            result["last_test"] = comparison
-            result["latest_test_attempt"] = _public_test_attempt(
-                latest_attempt, applicability=attempt_applicability, historical=True)
+            if scan_content:
+                result["content_fingerprint"] = await baseline.project_fingerprint(
+                    snapshot.workspace.executor, snapshot.project_root,
+                    max_files=max_files, max_bytes=max_content_bytes)
+                result["content_scan_budget"] = {
+                    "max_files": max_files,
+                    "max_content_bytes": max_content_bytes,
+                }
             result["communication"] = router.registry.metrics(state.workspace_id)
             result["communication"]["scope"] = "recorded_workspace_responses_before_this_call"
             result["operation_id"] = record
@@ -671,10 +630,10 @@ def create_server(router: SessionRouter, *, viewer_url: str | None = None,
     for name, function, description in (
         ("workspace_info", info, "Inspect this thread's persistent workspace and metadata identity. No remote execution."),
         ("workspace_history", history, "Read this thread's previous host/source-directory bindings, newest first."),
-        ("workspace_resume", resume, "Build a local-only recovery summary of this thread's binding, last test, saved jobs and note; local cache freshness is unknown and no SSH query is made."),
+        ("workspace_resume", resume, "Build a local-only recovery summary of this thread's binding, saved jobs and note; legacy test history is read only when include_legacy_test_history=true."),
         ("workspace_note", note, "Read or update this thread's small local recovery note (goal, constraints, decisions, next_step)."),
         ("resolve_operation", resolve_operation, "Recover the same background job by its idempotency_key after a lost response. This may make a read-only SSH status request to the saved origin, then reconnects local log collection; it never starts a second job."),
-        ("workspace_snapshot", workspace_snapshot, "Inspect current remote Git state, last test evidence for this target, and measured response bytes. Last test evidence does not certify the current code."),
+        ("workspace_snapshot", workspace_snapshot, "Inspect current remote Git state and measured response bytes. Project contents are not scanned unless scan_content=true; then the scan is bounded by max_files and max_content_bytes. No test history is compared."),
         ("workspace_changes", workspace_changes, "List files changed in this private session copy relative to its initial content baseline; no diff text is returned."),
         ("workspace_preview", workspace_preview, "Preview explicitly selected changed files against their original source with bounded unified diffs and apply guards."),
         ("workspace_apply", workspace_apply, "Apply selected, reviewed workspace_preview file entries back to the original source with per-file hash guards."),
@@ -705,9 +664,8 @@ def create_server(router: SessionRouter, *, viewer_url: str | None = None,
             if (_name in {"exec_command", "start_job"} and
                     authentication_command(arguments.get("command", ""))):
                 # Snapshot construction only initializes a local executor. Refuse
-                # before job reservation/origin access, remote state lookup,
-                # evidence invalidation, or an audit/attempt record containing
-                # command text. Keep a redacted refusal audit entry.
+                # before job reservation/origin access or remote state lookup.
+                # Keep a redacted refusal audit entry.
                 record_id = audit.create(
                     kind="tool", tool=_name,
                     arguments={"command": "[authentication arguments omitted]"},
@@ -725,8 +683,6 @@ def create_server(router: SessionRouter, *, viewer_url: str | None = None,
                     remote_state_dir=saved_origin["remote_state_dir"],
                     ssh_target=saved_origin["ssh_target"],
                     actual_cwd=saved_origin["actual_cwd"],
-                    test_attempt_id=saved_origin["test_attempt_id"],
-                    registry_path=str(router.registry.path),
                 )
             job_operation = None
             idempotency_key = arguments.pop("idempotency_key", None) if _name == "start_job" else None
@@ -818,205 +774,17 @@ def create_server(router: SessionRouter, *, viewer_url: str | None = None,
                         ssh_target=ssh_target)
             tool = bind_tool(snapshot.workspace, _name, _function, "")
             with audit.scoped_metadata(**snapshot.metadata(), client_session_id=identity.session_id):
-                if (_name in _EVIDENCE_INVALIDATING_TOOLS and
-                        not (_name in {"patch_file", "apply_patch"}
-                             and arguments.get("check_only") is True)):
-                    invalidate_test_cache(state.workspace_id, snapshot.target_id, _name)
-                test_command = (_name in {"exec_command", "start_job"} and
-                                is_test_command(arguments["command"]) and
-                                not authentication_command(arguments["command"]))
-                test_kind = "background" if _name == "start_job" else "foreground"
-                evidence_before = None
-                evidence_record = None
-                evidence_token = None
-                test_attempt = None
-                test_effective_cwd = None
-                if test_command:
-                    test_effective_cwd = snapshot.workspace.resolve_cwd(arguments.get("cwd"))
-                    pending = check_compute_review(
-                        arguments["command"], test_effective_cwd,
-                        snapshot.workspace.executor.config.ssh_target,
-                        arguments.get("compute_review"),
-                        getattr(snapshot.workspace.executor.config, "compute_review_threshold", 8),
-                    )
-                    if pending is None:
-                        evidence_record = audit.create(
-                            kind="tool", tool=("background_test_attempt" if test_kind == "background"
-                                               else "test_evidence_capture"),
-                            host=snapshot.host, cwd=test_effective_cwd,
-                            command=arguments["command"], status="running",
-                            job_id=arguments.get("job_id") if test_kind == "background" else None,
-                        )
-                        evidence_token = audit.operation_id.set(evidence_record)
                 try:
-                    try:
-                        if evidence_record is not None:
-                            attempt_id = evidence_record
-                            attempt_job_id = (arguments["job_id"] if test_kind == "background"
-                                              else "test-" + attempt_id)
-                            attempt_target = WorkspaceTarget(
-                                snapshot.target_id, state.workspace_id, snapshot.host,
-                                snapshot.source_cwd, snapshot.cwd, snapshot.project_root)
-                            test_attempt = router.registry.begin_test_attempt(
-                                state.workspace_id, attempt_target,
-                                attempt_id=attempt_id, job_id=attempt_job_id,
-                                command=arguments["command"], cwd=test_effective_cwd,
-                                execution_kind=test_kind, started_at=time.time(),
-                                before=None, revision=state.revision,
-                            )
-                            # Record the accepted attempt before doing even the
-                            # optional remote fingerprint read. A lost client
-                            # response or MCP restart can then still recover a
-                            # durable launch record if that read is interrupted.
-                            evidence_before = await test_evidence.capture(snapshot)
-                            test_attempt = router.registry.update_test_attempt(
-                                state.workspace_id, test_attempt["attempt_id"],
-                                state="running", process_exit_status="unknown",
-                                test_result="unknown", before=evidence_before,
-                                expected_target_id=snapshot.target_id,
-                                expected_job_id=test_attempt["job_id"],
-                            )
-                            audit.update(evidence_record, attempt_id=test_attempt["attempt_id"],
-                                         attempt_order=test_attempt["attempt_order"],
-                                         job_id=test_attempt["job_id"],
-                                         test_attempt_state="running", before=evidence_before)
-                            if test_kind == "background" and job_origin is not None:
-                                job_origin["test_attempt_id"] = test_attempt["attempt_id"]
-                                job_origin["registry_path"] = str(router.registry.path)
-                        with job_collector.scoped_origin(job_origin):
-                            result = await tool(**arguments)
-                    except BaseException:
-                        if job_operation is not None:
-                            try:
-                                router.registry.update_job_operation(
-                                    state.workspace_id, idempotency_key, "unknown")
-                            except (sqlite3.Error, OSError, ValueError):
-                                print("Remote Workbench job retry state unavailable", file=sys.stderr)
-                        if test_attempt is not None:
-                            try:
-                                router.registry.update_test_attempt(
-                                    state.workspace_id, test_attempt["attempt_id"],
-                                    state="unknown", process_exit_status="unknown",
-                                    test_result="unknown", error="command_response_unavailable",
-                                    expected_target_id=snapshot.target_id,
-                                    expected_job_id=test_attempt["job_id"],
-                                )
-                            except (sqlite3.Error, OSError, ValueError):
-                                print("Remote Workbench test attempt state unavailable", file=sys.stderr)
-                        if evidence_record is not None:
-                            audit.update(evidence_record, status="unknown",
-                                         error="Command response was unavailable; test execution state is unknown",
-                                         test_attempt_state="unknown",
-                                         test_attempt_error="command_response_unavailable",
-                                         test_attempt_observed_at=time.time())
-                        raise
-                    if evidence_record is not None:
-                        if result.get("executed") is False:
-                            if test_attempt is not None:
-                                router.registry.update_test_attempt(
-                                    state.workspace_id, test_attempt["attempt_id"],
-                                    state="rejected", process_exit_status="not_started",
-                                    test_result="unknown", output_id=result.get("output_id"),
-                                    error=result.get("message", "Command was not executed"),
-                                    expected_target_id=snapshot.target_id,
-                                    expected_job_id=test_attempt["job_id"],
-                                )
-                            audit.update(evidence_record, status="rejected",
-                                         message=result.get("message", "Test command was not executed"))
-                        elif test_kind == "background":
-                            if test_attempt is not None and (result.get("error") or
-                                    not result.get("job_output_id")):
-                                attempt_error = (result.get("state_reason") or result.get("error") or
-                                                "background_job_handle_unavailable")
-                                router.registry.update_test_attempt(
-                                    state.workspace_id, test_attempt["attempt_id"],
-                                    state="unknown", process_exit_status="unknown",
-                                    test_result="unknown", output_id=result.get("launch_output_id"),
-                                    error=attempt_error,
-                                    expected_target_id=snapshot.target_id,
-                                    expected_job_id=test_attempt["job_id"],
-                                )
-                                audit.update(evidence_record, status="unknown",
-                                             test_attempt_state="unknown",
-                                             test_attempt_error=attempt_error,
-                                             test_attempt_observed_at=time.time())
-                            elif test_attempt is not None:
-                                test_attempt = router.registry.update_test_attempt(
-                                    state.workspace_id, test_attempt["attempt_id"],
-                                    state="running", process_exit_status="unknown",
-                                    test_result="unknown", output_id=result["job_output_id"],
-                                    expected_target_id=snapshot.target_id,
-                                    expected_job_id=test_attempt["job_id"],
-                                )
-                            current_attempt = router.registry.test_attempt(
-                                state.workspace_id, test_attempt["attempt_id"])
-                            result = dict(result, test_attempt=_public_test_attempt(
-                                current_attempt, applicability=None, historical=True))
-                            if result.get("launch_output_id"):
-                                audit.update(evidence_record, output_id=result["launch_output_id"])
-                        else:
-                            evidence_after = await test_evidence.capture(snapshot)
-                            summary, summary_stream, summary_reason = test_evidence.summarize_complete_streams(
-                                result, result.get("output_id"),
-                                stdout_fallback=result.get("stdout"),
-                                stderr_fallback=result.get("stderr"),
-                                truncated=bool(result.get("truncated")),
-                            )
-                            observation = test_evidence.observation(
-                                evidence_before, evidence_after, result, arguments["command"],
-                                state.revision, attempt=test_attempt,
-                                output_id=result.get("output_id"), summary=summary,
-                                summary_stream=summary_stream, summary_reason=summary_reason,
-                            )
-                            process_status = observation["process_exit_status"]
-                            attempt_state = {
-                                "success": "finished", "failed": "failed",
-                                "cancelled": "cancelled", "timed_out": "timed_out",
-                            }.get(process_status, "unknown")
-                            try:
-                                test_attempt = router.registry.update_test_attempt(
-                                    state.workspace_id, test_attempt["attempt_id"],
-                                    state=attempt_state, process_exit_status=process_status,
-                                    exit_code=result.get("exit_code"),
-                                    test_result=observation["test_result"],
-                                    summary=summary, test_result_reason=summary_reason,
-                                    after=evidence_after, output_id=result.get("output_id"),
-                                    observation=observation,
-                                    expected_target_id=snapshot.target_id,
-                                    expected_job_id=test_attempt["job_id"],
-                                )
-                            except (sqlite3.Error, OSError):
-                                print("Remote Workbench test attempt completion unavailable", file=sys.stderr)
-                            if result.get("operation_id"):
-                                audit.update(evidence_record, parent_id=result["operation_id"])
-                                audit.add_child(result["operation_id"], evidence_record)
-                            audit.update(evidence_record, status=attempt_state,
-                                         test_observation=observation,
-                                         attempt_state=attempt_state,
-                                         process_exit_status=process_status,
-                                         test_result=observation["test_result"],
-                                         test_result_reason=summary_reason,
-                                         output_id=result.get("output_id"))
-                            result = dict(result, test_evidence={
-                                "status": observation["status"],
-                                "process_exit_status": process_status,
-                                "test_result": observation["test_result"],
-                                "tests_run": observation["tests_run"],
-                                "reported_skips": observation["reported_skips"],
-                                "executed": observation["executed"],
-                                "passed": observation["passed"],
-                                "applies_to_current_code": observation["applies_to_current_code"],
-                                "evidence": observation["evidence"],
-                                "environment_evidence": observation["environment_evidence"],
-                                "environment_limit": observation["environment_limit"],
-                                "test_result_reason": summary_reason,
-                            }, test_evidence_operation_id=evidence_record,
-                                test_attempt=_public_test_attempt(
-                                    test_attempt, applicability=observation["applies_to_current_code"],
-                                    historical=True))
-                finally:
-                    if evidence_token is not None:
-                        audit.operation_id.reset(evidence_token)
+                    with job_collector.scoped_origin(job_origin):
+                        result = await tool(**arguments)
+                except BaseException:
+                    if job_operation is not None:
+                        try:
+                            router.registry.update_job_operation(
+                                state.workspace_id, idempotency_key, "unknown")
+                        except (sqlite3.Error, OSError, ValueError):
+                            print("Remote Workbench job retry state unavailable", file=sys.stderr)
+                    raise
             if (job_origin is not None and isinstance(result, dict) and
                     result.get("job_output_id") and not result.get("error") and
                     result.get("execution_state") != "unknown"):
@@ -1047,14 +815,6 @@ def create_server(router: SessionRouter, *, viewer_url: str | None = None,
                     print("Remote Workbench job retry state unavailable", file=sys.stderr)
                 result = dict(result, idempotency_key=idempotency_key,
                               operation_state=operation_state, job_id=job_operation.job_id)
-            if _name in _JOB_CONTROL_TOOLS and isinstance(result, dict):
-                attempt = router.registry.test_attempt_for_job(
-                    state.workspace_id, arguments["job_id"])
-                if attempt is not None:
-                    result["test_attempt"] = _public_test_attempt(
-                        attempt, applicability=None, historical=True)
-                    if isinstance(attempt.get("observation"), dict):
-                        result["test_observation"] = _public_test_observation(attempt["observation"])
             return result
 
         register(name, public, description, execute)

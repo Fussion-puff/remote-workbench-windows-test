@@ -1,4 +1,8 @@
-"""Persist test-attempt completion from the local background-job collector."""
+"""Legacy offline helper for explicitly processing stored background evidence.
+
+The normal job collector no longer imports or calls this module. Its functions
+remain available for legacy history tooling and tests only.
+"""
 from __future__ import annotations
 
 import json

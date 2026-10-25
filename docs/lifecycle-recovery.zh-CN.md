@@ -10,7 +10,11 @@
 
 compact 模式通过 `workspace_tools` 调用这些现有工具。没有新增恢复 MCP 接口。
 
-`workspace_resume` 仍只读本地历史，不连接 SSH、不重启采集器；其状态不证明远端当前仍在运行。明确恢复后，采集器自行续读日志，`job_wait` 等待本地进展，不反复查询远端状态。
+阶段1中，MCP 负责记录明确目标上的命令、文件和后台任务生命周期事实；科研解释、验证是否充分以及被操作项目的测试适用性由调用 Agent 和用户判断。
+
+`workspace_resume(include_legacy_test_history=False)` 默认只返回 binding、jobs 和 note 操作事实，不读取或修改测试缓存。设为 `true` 时只读返回 `legacy_test_history`；其中历史记录对当前代码的适用性仍为未知，不触发 SSH 扫描。恢复状态不证明远端当前仍在运行。明确恢复后，采集器自行续读日志，`job_wait` 等待本地进展，不反复查询远端状态。
+
+`workspace_snapshot(scan_content=False, max_files=10000, max_content_bytes=67108864)` 默认执行显式元数据与 Git 检查；只有 `scan_content=true` 才扫描绑定的 `project_root`，可能包括选定 cwd 之外的仓库子目录。扫描沿用现有排除规则、不跟随符号链接，并受文件/目录条目数和文件内容字节预算约束；不完整时返回原因而非有效完整指纹。快照不会自动维护项目验证结论。compact 仍保留有界摘要；对 unittest/subTest，顶层测试数与报告的跳过数可能不属于同一计数层级，因此无法确定的执行数和通过数继续保持未知。
 
 ## 恢复能够确认什么
 
@@ -32,31 +36,20 @@ compact 模式通过 `workspace_tools` 调用这些现有工具。没有新增�
 
 C2 使用本地 worker、模拟 SSH 和临时独立工程验收，包括真实 MCP stdio 子进程重启、启动成功回复丢失、切换目标、分页续读、并发句柄和身份拒绝。测试不连接真实服务器，不代表 Codex App 已加载此代码。
 
-## 后台测试证据（D3）
+## 测试历史与结果边界
 
-可识别的测试命令在执行前登记一次测试尝试，记录稳定的 `attempt_id`、`job_id`、原 target、命令和执行目录；先登记，再获取可获得的前置指纹。丢失启动回复后恢复同一个 job，沿用同一次尝试。
+a13 曾实现 D3 后台测试尝试、终态采集和 `last_test`/适用性关联；当时的 538 项集成通过是历史验收记录，见[开发任务与执行状态](development-plan.zh-CN.md#a13-历史提交执行记录2026-10-26)。这些实现和结果不构成当前默认管理职责。当前默认路径不登记测试尝试、不推断或维护 `last_test`/当前代码适用性，也不由后台采集器补写测试证据。显式读取旧历史时，`legacy_test_history` 保持只读，并将当前适用性视为未知。
 
-| 记录 | 含义 |
-|---|---|
-| `latest_test_attempt` | 最近登记的测试尝试，包含运行、失败、取消、超时和未知状态 |
-| `last_test` | 最近启动且已有可靠终态和输出证据的完成观测；按持久启动顺序选择，不按结束顺序覆盖 |
-| `applies_to_current_code` | 历史内容/配置指纹是否与本次新鲜快照对应；不表示用例通过或当前环境已验证 |
+作业终态和测试解释是不同事实：当前作业字段 `execution_state`、`exit_code` 和 `timed_out` 等记录执行结果；compact summary 使用 `process_status`。有界测试摘要只保留能从输出明确得到的框架信息。unittest 的 `tests_run` 是顶层数量，`reported_skips` 可能包括 subTest，不能相减得到执行数；有跳过或计数层级不明时，`executed`、`passed` 保持未知。不能仅凭退出码 0 宣称测试充分或适用于当前项目。测试命令的选择、结果解释和验证充分性由调用 Agent 与用户负责。
 
-采集器会自动登记终态，不需要用户反复调用 `job_status`。断开采集时，同一尝试保留未知状态；重接后继续更新原尝试。已有可靠终态、后置指纹和观测时间不会被重复恢复或查询改写。
+## a13 历史实现与验收
 
-进程结果与测试报告分开：`process_exit_status` 记录进程事实，`test_result` 与摘要记录框架事实。unittest 的 `tests_run` 是顶层数量，`reported_skips` 可能包括 subTest；不能相减得到执行数。有跳过时 `executed`、`passed` 保持未知。未识别的测试框架、超出 1 MiB 的摘要范围、流不完整或解码失败，都保留未知原因及原输出位置，不仅凭退出码 0 宣称测试通过。
+历史提交 `ae380a9`（a13）曾包含后台测试尝试登记、终态证据采集、`last_test` 与当前代码关联。其本地模拟演示覆盖启动回复丢失、MCP 进程重启、切换目标后接回原 job、日志续读，以及较早后台任务完成不覆盖较新前台观测；当时的集成记录为 538 项通过，详见[开发任务与执行状态](development-plan.zh-CN.md#a13-历史提交执行记录2026-10-26)。这些行为和结果仅是历史事实，不描述当前测试文件或默认管理职责。
 
-`workspace_resume`、`resolve_operation` 和普通 job 查询返回历史视图，当前代码适用性保持未知。显式 `workspace_snapshot` 才用新指纹比较；测试执行本身仍是历史事件。指纹缺失时不补猜；依赖、激活环境和外部输入继续标为未验证。未知或未确认清理不等于任务已经结束，也不会填写确定的完成时间。
-
-测试证据写入失败不会改写已知 job 终态；本地审计记录证据未知的原因，恢复可补齐同一尝试。没有测试尝试信息的旧任务仍可按 C2 恢复作业，不能为它补造测试前证据。
-
-## 重复本地验收
+## 当前默认范围复现
 
 ```sh
-RWB_ACCEPTANCE_EVIDENCE_DIR=.local/validation/lifecycle \
-  .venv/bin/python -m pytest -q tests/test_mcp_job_recovery_stdio.py
+.venv/bin/python -m pytest -q tests/test_mcp_job_recovery_stdio.py tests/test_default_execution_scope.py
 ```
 
-测试自行建立临时独立工程、模拟 SSH 通道和真实 MCP stdio 子进程；无需真实 host 或密码。演示包含启动成功回复丢失、进程重启、切到 B 后接回 A、gate 释放前的实时输出、同 job/attempt 完成，以及较早后台任务晚完成不覆盖较新前台观测。JSON 证据写入指定本地目录。
-
-这组验证覆盖本地 worker、模拟 SSH 和真实 MCP 进程；真实服务器及 Codex App 实际加载版本需分别验收。
+当前复现范围是后台 job 的恢复、日志续读和原 target 路由，以及默认路径不自动登记测试尝试、不读取或更新测试缓存、不采集测试证据。结果由本轮验证记录说明。
