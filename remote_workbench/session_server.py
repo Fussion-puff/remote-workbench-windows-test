@@ -37,6 +37,13 @@ _JOB_CONTROL_TOOLS = {"job_status", "stop_job", "job_wait"}
 # command owns the workspace lease. Remote checks may observe intermediate
 # files while a command is running; they never mutate the workspace.
 _READ_ONLY_REMOTE_TOOLS = {"workspace_snapshot", "workspace_changes", "workspace_preview", "fetch_image"}
+_EVIDENCE_INVALIDATING_TOOLS = {
+    # Shell commands are opaque: wrappers, aliases and scripts make a command
+    # name allowlist too weak to establish that an exec was read-only.
+    "exec_command", "write_file", "patch_file", "apply_patch",
+    # Background work may edit the saved target while it runs or is stopped.
+    "start_job", "stop_job",
+}
 _SESSION_LOCAL_TOOLS = {"workspace_resume", "workspace_note"}
 _UNLOCKED_TOOLS = _LOCAL_TOOLS | _JOB_CONTROL_TOOLS | {
     "workspace_info", "workspace_history", "resolve_operation"
@@ -110,6 +117,14 @@ def create_server(router: SessionRouter, *, viewer_url: str | None = None,
 
     def workspace_url(state):
         return f"{viewer_url}/w/{state.workspace_id}/" if viewer_url else None
+
+    def invalidate_test_cache(workspace_id, target_id, operation):
+        if not target_id:
+            return
+        previous = router.registry.last_test(workspace_id, target_id)
+        if previous is not None:
+            router.registry.save_test(
+                workspace_id, target_id, test_evidence.invalidate(previous, operation))
 
     def pack(result, state, name=None, arguments=None):
         result = dict(result)
@@ -216,6 +231,15 @@ def create_server(router: SessionRouter, *, viewer_url: str | None = None,
                         if state.target_id else None)
         if isinstance(current_test, dict):
             current_test = dict(current_test)
+            # Resume only reads the local registry. Its cached test result is
+            # useful history, never proof about the code currently on the host.
+            current_test.update(
+                applies_to_current_code=None,
+                historical=True,
+                test_execution_is_historical=True,
+                current_code_checked=False,
+                current_applicability="unknown",
+            )
             command = current_test.pop("command", None)
             if isinstance(command, str):
                 current_test["command_preview"] = command[:240] + ("…" if len(command) > 240 else "")
@@ -317,6 +341,9 @@ def create_server(router: SessionRouter, *, viewer_url: str | None = None,
                     for key in ("baseline_state", "source_state", "session_state"):
                         item.pop(key, None)
             else:
+                # Applying a preview writes to the original source tree. It is
+                # conservatively treated as a possible change to this target.
+                invalidate_test_cache(state.workspace_id, snapshot.target_id, "workspace_apply")
                 result = await baseline.apply_delivery(
                     snapshot.workspace.executor, snapshot.project_root, arguments["files"])
             audit.update(record, status="failed" if result.get("error") else "finished",
@@ -612,6 +639,10 @@ def create_server(router: SessionRouter, *, viewer_url: str | None = None,
                     router.registry.register_job(state.workspace_id, job_id, origin)
             tool = bind_tool(snapshot.workspace, _name, _function, "")
             with audit.scoped_metadata(**snapshot.metadata(), client_session_id=identity.session_id):
+                if (_name in _EVIDENCE_INVALIDATING_TOOLS and
+                        not (_name in {"patch_file", "apply_patch"}
+                             and arguments.get("check_only") is True)):
+                    invalidate_test_cache(state.workspace_id, snapshot.target_id, _name)
                 test_command = (_name == "exec_command" and
                                 is_test_command(arguments["command"]) and
                                 not authentication_command(arguments["command"]))

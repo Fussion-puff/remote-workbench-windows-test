@@ -44,19 +44,66 @@ def observation(before, after, result, command, revision):
     }
 
 
+def invalidate(last_test, operation):
+    """Keep the result as history while withdrawing current-code applicability."""
+    if last_test is None:
+        return None
+    value = dict(last_test)
+    value.update(
+        applies_to_current_code=None,
+        historical=True,
+        invalidated=True,
+        invalidated_by=operation,
+        invalidated_at=time.time(),
+    )
+    return value
+
+
 def matches(left, right):
+    return _same_known_state(left, right) is True
+
+
+def _same_known_state(left, right):
     a, b = left.get('code', {}), right.get('code', {})
-    return bool(a.get('complete') and b.get('complete') and a.get('digest') and
-                a['digest'] == b.get('digest') and left.get('config_digest') == right.get('config_digest'))
+    if (not a.get('complete') or not b.get('complete') or not a.get('digest')
+            or not b.get('digest')):
+        return None
+    if a['digest'] != b['digest']:
+        return False
+    if not left.get('config_digest') or not right.get('config_digest'):
+        return None
+    return left['config_digest'] == right['config_digest']
 
 
 def compare(last_test, current):
     if last_test is None:
         return None
     value = dict(last_test, checked_at=time.time(), applies_to_current_code=None, historical=True)
+    current_code = current.get('code', {})
+    value.update(
+        test_execution_is_historical=True,
+        current_code_checked=True,
+        applicability_check_source='workspace_snapshot_fresh_bounded_fingerprint',
+        applicability_checked_at=current.get('observed_at') or time.time(),
+        applicability_check_scope=current_code.get('scope'),
+        applicability_check_configuration='workspace_execution_config_fingerprint',
+    )
+    if last_test.get('invalidated'):
+        value['applicability_revalidated_after_invalidation'] = False
     before, after = last_test.get('before'), last_test.get('after')
+    if after and after.get('config_digest') and current.get('config_digest'):
+        value['applicability_configuration_matched'] = (
+            after['config_digest'] == current['config_digest'])
+    else:
+        value['applicability_configuration_matched'] = None
     if last_test.get('status') in {'passed', 'failed'} and before and after and matches(before, after):
-        value['applies_to_current_code'] = matches(after, current) if current.get('code', {}).get('complete') else None
-        value['historical'] = value['applies_to_current_code'] is not True
+        if current_code.get('complete'):
+            current_matches = _same_known_state(after, current)
+            if last_test.get('invalidated'):
+                value['applies_to_current_code'] = current_matches
+                value['applicability_revalidated_after_invalidation'] = current_matches is True
+            else:
+                value['applies_to_current_code'] = current_matches
+            value['historical'] = value['applies_to_current_code'] is not True
     value['environment_verified_current'] = False
     return value

@@ -12,6 +12,7 @@ from mcp.server.lowlevel.server import request_ctx
 from mcp.shared.context import RequestContext
 
 from remote_workbench import audit
+from remote_workbench import test_evidence
 from remote_workbench import session_server as session_server_module
 from remote_workbench.config import HostConfig, ServerConfig
 from remote_workbench.server import require_connection, get_executor, workspace_executor
@@ -223,6 +224,8 @@ async def test_workspace_resume_bounds_and_pages_local_recovery_details(project,
         "operation_id": test_operation_id,
         "output_id": "pending-output",
         "status": "passed",
+        "applies_to_current_code": True,
+        "historical": False,
         "before": {
             "code": {"complete": True, "digest": "a" * 64, "scope": "bounded"},
             "config_digest": "b" * 64,
@@ -246,6 +249,11 @@ async def test_workspace_resume_bounds_and_pages_local_recovery_details(project,
     assert first["jobs_next_offset"] == 20
     assert first["jobs_truncated"] is True
     assert first["last_test"]["local_record_id"] == test_operation_id
+    assert first["last_test"]["applies_to_current_code"] is None
+    assert first["last_test"]["historical"] is True
+    assert first["last_test"]["test_execution_is_historical"] is True
+    assert first["last_test"]["current_code_checked"] is False
+    assert first["last_test"]["current_applicability"] == "unknown"
     assert "command" not in first["last_test"]
     assert len(first["last_test"]["command_preview"]) <= 241
     assert set(first["last_test"]["before"]["code"]) <= {
@@ -267,6 +275,167 @@ async def test_workspace_resume_bounds_and_pages_local_recovery_details(project,
     assert other["jobs_has_more"] is False
     with pytest.raises(ToolError, match="between 1 and 50"):
         await call(server, "a", "workspace_resume", limit=51)
+
+
+async def test_test_then_patch_resume_keeps_result_historical_and_uses_no_ssh(project, monkeypatch):
+    router, server, source, _ = project
+    tests_dir = source / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_smoke.py").write_text(
+        "import unittest\nclass Smoke(unittest.TestCase):\n"
+        "    def test_ok(self): self.assertEqual(1 + 1, 2)\n"
+    )
+    switched = await call(server, "a", "workspace_switch", host="a", cwd=str(source))
+    tested = await call(server, "a", "exec_command",
+                        command="python3 -m unittest discover -s tests")
+    assert tested["exit_code"] == 0
+    assert tested["test_evidence"]["status"] == "passed"
+    assert tested["test_evidence"]["applies_to_current_code"] is True
+
+    current = await call(server, "a", "read_file", path="value.txt")
+    assert router.registry.last_test(switched["workspace_id"], switched["target_id"])
+    assert not router.registry.last_test(switched["workspace_id"], switched["target_id"]).get("invalidated")
+    patched = await call(server, "a", "patch_file", path="value.txt", old="original",
+                         new="patched", expected_sha256=current["sha256"])
+    assert not patched.get("error"), patched
+    stale = router.registry.last_test(switched["workspace_id"], switched["target_id"])
+    assert stale["status"] == "passed"
+    assert stale["applies_to_current_code"] is None
+    assert stale["historical"] is True
+    assert stale["invalidated"] is True
+    assert stale["invalidated_by"] == "patch_file"
+
+    snapshot = router.snapshot(router.registry.get(switched["workspace_id"]))
+    monkeypatch.setattr(snapshot.workspace.executor, "check_connection",
+                        AsyncMock(side_effect=AssertionError("resume checked SSH")))
+    monkeypatch.setattr(snapshot.workspace.executor, "run_program",
+                        AsyncMock(side_effect=AssertionError("resume ran a remote command")))
+    resumed = await call(server, "a", "workspace_resume")
+    assert resumed["remote_query_performed"] is False
+    assert resumed["last_test"]["status"] == "passed"
+    assert resumed["last_test"]["applies_to_current_code"] is None
+    assert resumed["last_test"]["historical"] is True
+    assert resumed["last_test"]["test_execution_is_historical"] is True
+    assert resumed["last_test"]["current_applicability"] == "unknown"
+    compact = create_server(router, tool_profile="compact")
+    compact_resume = await call(compact, "a", "workspace_tools", tool="workspace_resume")
+    assert compact_resume["last_test"]["applies_to_current_code"] is None
+    assert compact_resume["last_test"]["current_applicability"] == "unknown"
+
+
+async def test_fresh_snapshot_reassociates_same_code_after_nonmutating_exec(project):
+    router, server, source, _ = project
+    tests_dir = source / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_smoke.py").write_text(
+        "import unittest\nclass Smoke(unittest.TestCase):\n"
+        "    def test_ok(self): self.assertEqual(1 + 1, 2)\n"
+    )
+    subprocess.run(["git", "init", "-q", str(source)], check=True)
+    subprocess.run(["git", "-C", str(source), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(source), "-c", "user.name=Test", "-c",
+                    "user.email=test@example.invalid", "commit", "-qm", "baseline"], check=True)
+
+    switched = await call(server, "a", "workspace_switch", host="a", cwd=str(source))
+    tested = await call(server, "a", "exec_command",
+                        command="python3 -m unittest discover -s tests")
+    assert tested["test_evidence"]["applies_to_current_code"] is True
+    test_id = tested["operation_id"]
+
+    status = await call(server, "a", "exec_command", command="git status --short")
+    assert status["exit_code"] == 0
+    stale = router.registry.last_test(switched["workspace_id"], switched["target_id"])
+    assert stale["operation_id"] == test_id
+    assert stale["invalidated_by"] == "exec_command"
+
+    resumed = await call(server, "a", "workspace_resume")
+    assert resumed["last_test"]["operation_id"] == test_id
+    assert resumed["last_test"]["applies_to_current_code"] is None
+    assert resumed["last_test"]["current_applicability"] == "unknown"
+
+    snapshot = await call(server, "a", "workspace_snapshot")
+    current = snapshot["last_test"]
+    assert current["operation_id"] == test_id
+    assert current["status"] == "passed"
+    assert current["invalidated"] is True
+    assert current["invalidated_by"] == "exec_command"
+    assert current["applies_to_current_code"] is True
+    assert current["applicability_revalidated_after_invalidation"] is True
+    assert current["applicability_check_scope"] == snapshot["content_fingerprint"]["scope"]
+    assert current["applicability_check_configuration"] == "workspace_execution_config_fingerprint"
+    assert current["applicability_configuration_matched"] is True
+    assert current["applicability_checked_at"] > 0
+    assert current["test_execution_is_historical"] is True
+    assert current["operation_id"] == test_id
+    assert current["environment_verified_current"] is False
+    assert current["after"]["code"]["digest"] == snapshot["content_fingerprint"]["digest"]
+
+    # A later local-only resume still cannot reuse the snapshot's remote check.
+    resumed_again = await call(server, "a", "workspace_resume")
+    assert resumed_again["last_test"]["operation_id"] == test_id
+    assert resumed_again["last_test"]["applies_to_current_code"] is None
+    assert resumed_again["last_test"]["current_applicability"] == "unknown"
+
+    modified = await call(server, "a", "exec_command", command="printf changed > value.txt")
+    assert modified["exit_code"] == 0
+    changed_snapshot = await call(server, "a", "workspace_snapshot")
+    changed_evidence = changed_snapshot["last_test"]
+    assert changed_evidence["operation_id"] == test_id
+    assert changed_evidence["invalidated_by"] == "exec_command"
+    assert changed_evidence["applies_to_current_code"] is False
+    assert changed_evidence["historical"] is True
+    assert changed_evidence["applicability_revalidated_after_invalidation"] is False
+
+
+async def test_writes_apply_patch_and_arbitrary_exec_invalidate_cached_evidence(project):
+    router, server, source, _ = project
+    subprocess.run(["git", "init", "-q", str(source)], check=True)
+    subprocess.run(["git", "-C", str(source), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(source), "-c", "user.name=Test", "-c",
+                    "user.email=test@example.invalid", "commit", "-qm", "baseline"], check=True)
+    switched = await call(server, "a", "workspace_switch", host="a", cwd=str(source))
+    workspace_id, target_id = switched["workspace_id"], switched["target_id"]
+    point = {"code": {"complete": True, "digest": "a" * 64},
+             "config_digest": "b" * 64}
+
+    def save_passing_test():
+        router.registry.save_test(workspace_id, target_id, test_evidence.observation(
+            point, point, {"exit_code": 0, "execution_state": "finished"}, "pytest", 1))
+
+    save_passing_test()
+    written = await call(server, "a", "write_file", path="value.txt", content="written\n")
+    assert not written.get("error"), written
+    assert router.registry.last_test(workspace_id, target_id)["invalidated_by"] == "write_file"
+
+    save_passing_test()
+    patched = await call(server, "a", "patch_file", path="value.txt", old="written",
+                         new="patched")
+    assert not patched.get("error"), patched
+    assert router.registry.last_test(workspace_id, target_id)["invalidated_by"] == "patch_file"
+
+    save_passing_test()
+    applied = await call(server, "a", "apply_patch", cwd=".", patch=(
+        "*** Begin Patch\n*** Update File: value.txt\n@@\n-patched\n+applied\n*** End Patch"
+    ))
+    assert not applied.get("error"), applied
+    assert router.registry.last_test(workspace_id, target_id)["invalidated_by"] == "apply_patch"
+
+    preview = await call(server, "a", "workspace_preview", paths=["value.txt"])
+    save_passing_test()
+    delivered = await call(server, "a", "workspace_apply", files=preview["files"])
+    assert any(item["status"] == "applied" for item in delivered["files"]), delivered
+    assert router.registry.last_test(workspace_id, target_id)["invalidated_by"] == "workspace_apply"
+
+    save_passing_test()
+    executed = await call(server, "a", "exec_command", command=(
+        "python3 -c \"from pathlib import Path; Path('value.txt').write_text('exec-write')\""
+    ))
+    assert executed["execution_state"] == "finished"
+    assert executed["exit_code"] == 0
+    stale = router.registry.last_test(workspace_id, target_id)
+    assert stale["invalidated"] is True
+    assert stale["invalidated_by"] == "exec_command"
+    assert stale["applies_to_current_code"] is None
 
 
 async def test_baseline_delivery_tools_list_preview_and_apply(project):
@@ -670,8 +839,8 @@ async def test_snapshot_test_scope_and_response_byte_accounting(project):
     assert tested["exit_code"] == 0
     assert tested["test_evidence"]["status"] == "passed"
     assert tested["test_evidence"]["applies_to_current_code"] is True
-    renamed = await call(server, "a", "exec_command", command="git mv value.txt renamed.txt")
-    assert renamed["exit_code"] == 0
+    # Simulate an external editor changing the private project between tools.
+    Path(state["cwd"], "value.txt").write_text("changed outside Remote Workbench\n")
     snapshot = await call(server, "a", "workspace_snapshot")
     assert snapshot["git"]["modified_files"] == 1 and snapshot["git"]["status_complete"]
     assert snapshot["last_test"]["operation_id"] == tested["operation_id"]
