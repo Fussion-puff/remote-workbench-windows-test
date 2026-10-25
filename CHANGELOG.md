@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.0a10
+
+- Always include filenames in remote grep matches, including a single input file on GNU grep; preserve the same result format across Linux and macOS.
+
 ## 0.3.0a9 (develop)
 
 - Enable automatic refresh by default when opening the local audit viewer; keep the manual off switch and page-restore behavior.

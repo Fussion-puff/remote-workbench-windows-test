@@ -10,7 +10,7 @@ cd remote-workbench
 uv sync --locked
 ```
 
-日常 stable 应从已验证提交构建 wheel 并独立安装；develop 源码用于测试。安装和推广方式见[开发与稳定版部署](development.zh-CN.md)。
+日常 stable 应从 main 的已验证固定提交构建 wheel 并独立安装；develop 源码先行开发和测试。安装和推广方式见[开发与稳定版部署](development.zh-CN.md)。
 
 ## 2. 配置可选服务器
 

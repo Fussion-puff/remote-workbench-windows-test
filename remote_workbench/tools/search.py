@@ -36,7 +36,8 @@ async def ssh_grep(
     if not path:
         raise ValueError("path must not be empty")
 
-    args = ["grep", "-rn"]
+    # GNU grep otherwise omits the filename when path names one file.
+    args = ["grep", "-rnH"]
     if case_insensitive:
         args.append("-i")
     if context_lines > 0:

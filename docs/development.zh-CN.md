@@ -1,6 +1,6 @@
 # 本机开发版与稳定版
 
-建议把源码开发环境和 Codex 日常使用的稳定版分开放。下面用 `~/opt/remote-workbench` 举例；它只是本机目录示例。Codex MCP 配置里的 `command`、manifest 和审计目录都要填写展开后的绝对路径。
+`main` 是 stable 源码主分支，`develop` 用于先行开发与验证。建议把源码开发环境和 Codex 日常使用的稳定版分开放。下面用 `~/opt/remote-workbench` 举例；它只是本机目录示例。Codex MCP 配置里的 `command`、manifest 和审计目录都要填写展开后的绝对路径。
 
 ```text
 ~/opt/remote-workbench/
@@ -93,7 +93,7 @@ Develop 的 `0.3.0a1` 增加了 `remote-workbench-session`。它使用请求 met
 
 固定 workspace 入口仍可供明确选择单个远端模板的旧流程使用。其 `workspace_info()` 现在仅查看本地配置；`probe=true` 才检查远端，避免为了查看信息而准备目录。
 
-推广顺序是：develop 通过本机回归与隔离 wheel 验收后提交、推送；再从该固定提交的 wheel 创建新的 stable release、验证安装来源与默认本地行为，最后手动切换日常启动器。stable 不使用 editable 安装，不因 develop 的后续修改自动更新；没有自动定时升级。真实集群测试与本机模拟验收分开记录。
+推广顺序是：develop 通过本机回归后提交、推送，等待对应提交的 GitHub CI 通过；再将该固定提交快进到 main，并核对 main CI。从 main 的同一固定提交构建 wheel、独立验收并创建本地 stable release，最后手动切换日常启动器。stable 不使用 editable 安装，不因 develop 的后续修改自动更新；没有自动定时升级。真实集群测试与本机模拟验收分开记录。
 
 日常入口示例：
 

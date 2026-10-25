@@ -8,9 +8,11 @@ This is an independently maintained derivative of [Onirika](https://github.com/x
 
 本机开发环境与日常稳定版的隔离、安装和切换方式见[开发与稳定版部署](docs/development.zh-CN.md)。
 
-Develop also includes an opt-in `remote-workbench-session` prototype (0.3.0a9): persistent workspaces routed by MCP `_meta.threadId`, atomic host/directory switching, jobs pinned to their original targets and checked against node/process identity, explicit project snapshots, and measured response bytes. Each thread keeps its own remote project copies. An identity-only diagnostic is available before enabling remote tools. This does not change an independently installed stable release; see [Session 原型与客户端联调边界](docs/session-prototype.zh-CN.md).
+The `main` branch holds the validated stable source; `develop` receives changes first. Promote a fixed commit only after develop CI passes, then check main CI before updating the independent local stable installation.
 
-Develop 的改进包括任务重试去重、独立控制通道、后台日志自动采集、本地等待与搜索、工程基线及交付预览，见[可靠性与权限边界](docs/reliability.zh-CN.md)。stable 只在独立验证后手动推广固定构建；凭证隔离和真实集群验收仍需单独完成。
+The `remote-workbench-session` entry point (0.3.0a10) provides: persistent workspaces routed by MCP `_meta.threadId`, atomic host/directory switching, jobs pinned to their original targets and checked against node/process identity, explicit project snapshots, and measured response bytes. Each thread keeps its own remote project copies. An identity-only diagnostic is available before enabling remote tools. This does not change an independently installed stable release; see [Session 原型与客户端联调边界](docs/session-prototype.zh-CN.md).
+
+当前版本提供任务重试去重、独立控制通道、后台日志自动采集、本地等待与搜索、工程基线及交付预览，见[可靠性与权限边界](docs/reliability.zh-CN.md)。stable 只在独立验证后手动推广固定构建；凭证隔离和真实集群验收仍需单独完成。
 
 ## Work locally and across several servers
 

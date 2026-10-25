@@ -1,6 +1,6 @@
 # 按 Codex 对话路由的 Session 原型
 
-`remote-workbench-session` 从 `0.3.0a1` 起作为 develop 的可选入口，当前目标版本为 `0.3.0a9`。它复用原有 SSH、文件、Git 和后台任务工具，保留 `remote-workbench-workspace` 与 `remote-workbench-ssh`。安装到独立 wheel 环境的日常版不会随开发源码改变。
+`remote-workbench-session` 从 `0.3.0a1` 起作为 develop 的可选入口，当前目标版本为 `0.3.0a10`。它复用原有 SSH、文件、Git 和后台任务工具，保留 `remote-workbench-workspace` 与 `remote-workbench-ssh`。安装到独立 wheel 环境的日常版不会随开发源码改变。
 
 `0.3.0a5` 增加前后台任务的独立监督、进程组清理、`stop_job` 和独立清理命令。大量计算由 Agent 展示命令、并发规模和环境，等待用户明确确认后启动；普通工程操作直接执行，不要求 cgroup 或统一进程数上限。适用范围与实际清理边界见[计算审核与任务生命周期](process-safety.zh-CN.md)。本轮仅进行了本地受控测试，尚未做集群验收，也未替换 stable。
 
