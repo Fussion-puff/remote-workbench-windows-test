@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.0a9 (develop)
+
+- Enable automatic refresh by default when opening the local audit viewer; keep the manual off switch and page-restore behavior.
+
 ## 0.3.0a8 (develop)
 
 - Add `fetch_image` for private local copies of remote PNG/JPG/PDF/SVG files, returning chat image Markdown and paths without binary MCP payloads.

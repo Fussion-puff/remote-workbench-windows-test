@@ -43,6 +43,7 @@ class Element {
 const A = 'a'.repeat(32), B = 'b'.repeat(32), C = 'c'.repeat(32);
 const viewerId = process.argv[3] || '';
 const responseViewer = process.argv[4] || '';
+const defaultLive = process.argv[5] === 'true';
 const prefix = (viewerId ? '/v/' + viewerId : '') + '/w/' + 'd'.repeat(32);
 const clone = value => JSON.parse(JSON.stringify(value));
 const flush = () => new Promise(resolve => setImmediate(resolve));
@@ -161,6 +162,22 @@ async function run(name) {
     f.state.records.get(A).output_source_id = C; f.state.records.get(A).status = 'finished';
     f.state.streams.set(C + ':stdout', 'child output\n'); await f.tick();
     assert.equal(f.el('output').textContent, 'child output\n');
+  } else if (name === 'default_live' || name === 'disable_default_live') {
+    f = await boot({checked: defaultLive});
+    assert.equal(f.el('live').checked, true, 'the shipped HTML enables polling by default');
+    assert.equal(f.timers.size, 1, 'opening the page starts polling without a click');
+    if (name === 'default_live') {
+      f.add(B, 'automatic\n'); await f.tick();
+      assert.equal(f.el('output').textContent, 'automatic\n');
+    } else {
+      f.el('live').checked = false; await f.el('live').emit('change');
+      assert.equal(f.timers.size, 0, 'the user can stop default polling');
+      await f.events.get('pageshow')();
+      assert.equal(f.timers.size, 0, 'restoring a page respects the user disabling polling');
+      f.state.streams.set(A + ':stdout', 'first\nmanual\n');
+      await f.el('refresh').emit('click'); await flush();
+      assert.equal(f.el('output').textContent, 'first\nmanual\n');
+    }
   } else if (name === 'restored_checkbox') {
     f = await boot({checked: true}); f.add(B, 'restored\n'); await f.tick();
     assert.equal(f.el('output').textContent, 'restored\n');

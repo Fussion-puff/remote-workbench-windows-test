@@ -1,5 +1,10 @@
 # Validation status
 
+## Default viewer refresh (0.3.0a9)
+
+- Targeted viewer/session regressions: 42 tests passed (7.05 seconds), including the shipped HTML checkbox default, polling without a click, manual off, page restore, and manual refresh after disabling polling.
+- Full-suite results below belong to their recorded releases; the HTML default change does not alter command execution or image fetching.
+
 ## Chat image fetch (0.3.0a8)
 
 - Full local regression suite: 435 tests passed (95.86 seconds).
