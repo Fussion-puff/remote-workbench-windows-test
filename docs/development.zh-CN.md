@@ -60,36 +60,32 @@ uv pip install --python "$RELEASE/.venv/bin/python" \
 shasum -a 256 "$RELEASE/dist/remote_workbench-0.2.3-py3-none-any.whl"
 ```
 
-## Codex MCP 配置与切换
+## Codex 只注册一个 MCP
 
-稳定版 workspace manifest 要显式填写稳定版 `config`，避免继承 `REMOTE_WORKBENCH_CONFIG` 或读到默认配置；其 `cwd` 指向日常工程模板。首次远端工具调用会创建 session 专用副本，日常工程模板不被工具修改。稳定版的 MCP 项使用独立审计根目录和 `--viewer-port 8768`。示意如下，所有本机路径都要替换为真实绝对路径：
+日常只保留一个名为 `remote-workbench` 的条目，指向已验证的 stable session 启动器。stable 和 develop 是两个独立安装渠道，不是两个需要同时注册的 MCP。服务器由同一服务按聊天切换，不为每台服务器再注册一个条目。
 
 ```toml
-[mcp_servers.remote-workbench-stable]
-command = "/absolute/path/to/opt/remote-workbench/stable/releases/0.2.3-a1b2c3d/.venv/bin/remote-workbench-workspace"
-args = ["--workspace", "/absolute/path/to/opt/remote-workbench/stable/workspace.json", "--viewer-port", "8768"]
-env = { REMOTE_WORKBENCH_AUDIT_DIR = "/absolute/path/to/opt/remote-workbench/stable/audit" }
-
-[mcp_servers.remote-workbench-develop]
-enabled = false
-command = "/absolute/path/to/opt/remote-workbench/develop/.venv/bin/remote-workbench-workspace"
-args = ["--workspace", "/absolute/path/to/opt/remote-workbench/develop/workspace.json", "--viewer-port", "8769"]
-env = { REMOTE_WORKBENCH_AUDIT_DIR = "/absolute/path/to/opt/remote-workbench/develop/audit" }
+[mcp_servers.remote-workbench]
+command = "/absolute/path/to/stable/bin/remote-workbench-session"
+args = []
+enabled = true
 ```
 
-开发版 manifest 的 `config` 和 `cwd` 应分别指向开发配置及远端测试模板。稳定版 manifest 的 `config` 和 `cwd` 则固定到稳定配置及日常工程模板。不要让开发与稳定 workspace 共用 audit 根目录；两个 viewer 使用不同的首选端口。同一个 MCP 被多个聊天同时启动时，每个 stdio 进程生成独立 session、审计记录、输出、查看页及远端工程副本。若发生端口冲突，实际查看地址会在工具返回的 `operation_log` Markdown 链接中给出；也可查看 `workspace_info.viewer_url`。链接的标题固定为 **Remote Workbench 操作记录**，MCP 指令要求 agent 在工具调用后的回复附上它，不需要再额外调用 `workspace_info` 来获取链接。
+启动器应固定 stable release 的 Python/入口，并明确传入 stable 的 `--config`、`--data-dir` 和查看器端口。新聊天默认本地；`workspace_info` 仅读本地身份和状态。需要远端时才选择主机及源目录，本地命令始终使用原生工具。
 
-远端工程副本放在 `source_parent/.remote-workbench-sessions/source_basename/session_uuid/project`。从 Git 模板创建副本时，会带上模板当前的已跟踪工作树（包含未提交修改）和未被忽略的未跟踪文件；忽略的依赖、环境目录和缓存不复制。模板只作为每个新 session 的起点，不会由工具直接修改。进程重启会创建全新 UUID、日志及远端副本；旧目录和本机记录保留，任务目录及环境不会自动复用。该保证是 MCP 进程级的；固定 workspace 模式不获得或推断 Codex chat ID。若客户端把多聊天复用在一个进程内，必须提供显式 session 路由才有聊天级隔离。
+开发测试也使用同一个 MCP 名称：临时将这一个条目的 command 改为 develop session 启动器，测试结束后改回 stable。两个启动器各自使用独立状态和查看器端口，不额外增加 `remote-workbench-develop` 或项目级重复条目。日常新聊天不会因 develop 源码更新而切换版本。
 
-发布时，先在新 release 环境核对版本和导入路径，再用新版本运行 `workspace_info`，确认远端主机、目录和默认 shell；随后确认命令、输出和 diff 出现在稳定版审计记录与本机 viewer 中。通过后，把 Codex 稳定 MCP 项的 `command` 明确改为新 release 的启动器路径，重新加载 MCP 配置，再做一次连接检查。该切换不会自动从 Git 拉取或更新代码。
+身份诊断通常由 `workspace_info` 提供的 `identity_source`、`client_session_id`、`mode` 和工作区 ID完成。缺少 threadId 时会明确拒绝路由。需要检查原始 metadata 键时，可在隔离的命令行测试中使用 `--identity-probe`；它不作为另一个常驻 MCP 注册。
 
-每个旧 release 的 wheel、venv 和版本记录都保留。若新版本有问题，把稳定 MCP 的 `command` 改回旧 release 路径并重新加载即可回滚；不要删除仍可能用于回滚的版本目录。开发项默认禁用，只有需要检验新改动时才启用它。
+每次工具结果提供 **Remote Workbench 操作记录** 链接；查看器端口冲突时以返回地址为准。stable/develop 的日志和状态保留在各自目录；合并配置条目不合并不同聊天的数据，也不删除旧副本或 release。
+
+切换渠道或更新单一条目的启动器后，重载客户端 MCP。旧工具列表可能继续缓存，需确认当前条目是 `remote-workbench` 并包含 `workspace_use_local`。回滚时把同一条目的启动器改回保留的旧 release，不新增第二个 MCP。
 
 ## 可选的对话级 Session 原型
 
 Develop 的 `0.3.0a1` 增加了 `remote-workbench-session`。它使用请求 metadata 中的 threadId 和本机 SQLite Registry，支持跨进程恢复及主机/模板切换，同时保留每个对话的私有远端工程副本。它使用单独的 `--data-dir`，首次工作区未绑定；不会继承固定 workspace manifest 的默认目标。详见 [Session 原型](session-prototype.zh-CN.md)。
 
-启用开发原型前，需要在实际客户端验证 `_meta.threadId`；SDK 测试客户端主动传入 metadata 的成功结果不能代替这一检查。当前日常稳定版无需切换或升级。
+启用开发原型前，需要在实际客户端验证 `_meta.threadId`；SDK 测试客户端主动传入 metadata 的成功结果不能代替这一检查。日常只使用一个固定 stable 入口，develop 验证不自动推广到日常版。
 
 ## `0.3.0a6` 起的混合工作入口与推广顺序
 
@@ -102,7 +98,7 @@ Develop 的 `0.3.0a1` 增加了 `remote-workbench-session`。它使用请求 met
 日常入口示例：
 
 ```toml
-[mcp_servers.remote-workbench-stable]
+[mcp_servers.remote-workbench]
 command = "/absolute/path/to/stable/releases/VERSION-COMMIT/venv/bin/remote-workbench-session"
 args = ["--config", "/absolute/path/to/stable/hosts.yaml", "--data-dir", "/absolute/path/to/stable/session-data", "--viewer-port", "8768"]
 enabled = true

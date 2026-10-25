@@ -14,6 +14,8 @@ Develop 的改进包括任务重试去重、独立控制通道、后台日志自
 
 ## Work locally and across several servers
 
+Register one MCP named `remote-workbench`. Stable/develop are installation channels; switching channels replaces this entry’s launcher instead of adding another MCP. Routine identity checks use `workspace_info`.
+
 For mixed local and remote projects, use `remote-workbench-session`. Each new chat starts in local mode; tool discovery and `workspace_info` do not contact SSH. Use native local tools for local commands, choose a remote host and source directory with `workspace_switch`, and use `workspace_use_local` to clear that chat's active remote binding. Choosing a server does not redirect all project commands. Existing jobs stay attached to their original server when you switch, and other chats keep independent targets. See [本地与多服务器协作](docs/reliability.zh-CN.md#同一项目的本地与多服务器协作).
 
 ## Use a remote project as the default environment

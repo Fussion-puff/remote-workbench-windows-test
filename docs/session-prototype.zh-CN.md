@@ -94,13 +94,13 @@ uv run --locked remote-workbench-session \
 MCP 客户端配置示例，路径需替换为本机展开后的绝对路径：
 
 ```toml
-[mcp_servers.remote-workbench-session-develop]
+[mcp_servers.remote-workbench]
 enabled = false
 command = "/absolute/path/to/develop/.venv/bin/remote-workbench-session"
 args = ["--config", "/absolute/path/to/develop/hosts.yaml", "--data-dir", "/absolute/path/to/develop/session-data", "--viewer-port", "8770"]
 ```
 
-如只在开发项目联调，可将此表放入已信任项目的 `.codex/config.toml`，将 `enabled` 改为 `true`，并加上 `required = true`，让客户端等待该服务初始化。这样其他项目无需加载这组原型工具。包含个人绝对路径的项目配置应排除出 Git。保存后通过 App 的 Restart 加载新工具；日常版使用原有独立配置。
+只保留一个 `remote-workbench` 注册项。联调时替换同一条目的启动命令，而不是在全局和项目配置中同时增加 develop 条目；测试完成后改回固定 stable 启动器。也可仅在指定项目配置该唯一条目，并确保全局没有另一组重复注册。包含个人绝对路径的配置应排除出 Git；更换渠道后重载客户端工具。
 
 原型不改变客户端的进程管理。客户端可以让不同聊天启动不同 stdio 进程，也可以向同一个进程发送多个 threadId；两种情况均按同一个 SQLite Registry 路由。仅使用 stdio 配置不能保证 App 自动共享一个 MCP 进程。本阶段没有新增常驻 HTTP MCP 服务。
 
@@ -128,23 +128,15 @@ remote-workbench-session --identity-probe --data-dir /absolute/path/to/develop/i
 
 诊断用 MCP 配置示例：
 
-```toml
-[mcp_servers.remote-workbench-identity-probe]
-enabled = true
-required = true
-command = "/absolute/path/to/develop/.venv/bin/remote-workbench-session"
-args = ["--identity-probe", "--data-dir", "/absolute/path/to/develop/identity-data", "--viewer-port", "8771"]
-```
-
-诊断期间的 `required = true` 让支持该选项的客户端等待探针初始化完成。它不能刷新已经加载的工具列表，也不能补充缺失的 threadId。联调结束后可关闭此临时诊断项。
+该专用探针只用于隔离的 CLI 诊断，不再额外注册 `remote-workbench-identity-probe` MCP。日常统一入口的 `workspace_info` 已提供身份来源、当前模式和工作区 ID；缺少身份会明确报错。高级 metadata 排查仍可运行上述命令行模式。
 
 ### 设置中可见，但当前对话无法调用
 
 需要分别核对三个阶段：
 
 1. **服务已配置并启动**：设置中出现条目、进程运行、端口监听或启动日志报告 ready，只证明服务启动成功。
-2. **工具进入当前对话**：当前对话能发现并调用 `session_identity_probe`。新回合仍可能沿用先前的 MCP 连接，继续发送消息不保证刷新工具列表。
-3. **身份实际传入**：真实调用返回 `identity_available=true`，操作记录包含客户端传入的 threadId。只有这一阶段才能验证当前 App 的身份转发。
+2. **工具进入当前对话**：当前对话能发现并调用 `workspace_info`（隔离探针模式则是 `session_identity_probe`）。新回合仍可能沿用先前的 MCP 连接，继续发送消息不保证刷新工具列表。
+3. **身份实际传入**：统一入口成功返回 `identity_source="mcp._meta.threadId"` 和工作区 ID；隔离探针则返回 `identity_available=true`。只有这一阶段才能验证当前 App 的身份转发。
 
 第一阶段成功而第二阶段缺失时，按 [官方配置步骤](https://learn.chatgpt.com/docs/extend/mcp#configure-in-the-chatgpt-desktop-app)在保存设置后选择 Restart，再回到原对话检查。单独启动 CLI 或 Python MCP 客户端可以检查配置、协议和服务实现，但不能证明当前 App 对话已经获得工具或转发身份。
 
