@@ -8,9 +8,9 @@ This is an independently maintained derivative of [Onirika](https://github.com/x
 
 本机开发环境与日常稳定版的隔离、安装和切换方式见[开发与稳定版部署](docs/development.zh-CN.md)。
 
-Develop 提供精简工具模式与完整任务 Token 预算检查；当前额外用量上限为 2%，最新真实配对样本为 4.613%，尚未达标。功能完整性是前提，见[任务用量预算](docs/token-budget.zh-CN.md)。
+Develop 的精简工具模式照常可用；Token/credits 计量仅用于手动运行的独立、可重复基准样本。Remote Workbench 自身的日常命令、编辑和测试路径不采集 token/credits 或模型费用，也不为计量增加模型调用；日常工作流不在回复或 UI 中追加用量评估，基准门槛也不阻止普通任务完成。上述约定仅限定 Remote Workbench 自身的执行与集成路径，不声明 Codex App 或模型服务如何记录账户用量。离线费用账本和门槛脚本仅作为测试辅助工具保留；完整操作记录与必要执行诊断照常保留。基准口径与历史样本见[独立 Token 基准](docs/token-budget.zh-CN.md)。
 
-第一批可靠性修复、离线费用账本及后续目录模式设计见[开发任务与执行状态](docs/development-plan.zh-CN.md)和[direct/copy 契约](docs/workspace-mode-contract.zh-CN.md)。费用脚本为 `python3 scripts/build_cost_ledger.py --help`；费率或速度缺失时保留未知，不当作实际零费用。
+第一批可靠性修复、离线费用账本测试工具及后续目录模式设计见[开发任务与执行状态](docs/development-plan.zh-CN.md)和[direct/copy 契约](docs/workspace-mode-contract.zh-CN.md)。费用脚本为 `python3 scripts/build_cost_ledger.py --help`，仅用于手动基准样本；费率或速度缺失时保留未知，不当作实际零费用。
 
 The `main` branch holds the validated stable source; `develop` receives changes first. Promote a fixed commit only after develop CI passes, then check main CI before updating the independent local stable installation.
 
