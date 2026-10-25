@@ -16,7 +16,9 @@ from remote_workbench import test_evidence
 from remote_workbench import session_server as session_server_module
 from remote_workbench.config import HostConfig, ServerConfig
 from remote_workbench.server import require_connection, get_executor, workspace_executor
-from remote_workbench.session_server import create_server
+from remote_workbench.session_server import (
+    _public_test_attempt, _public_test_observation, create_server,
+)
 from remote_workbench.ssh import SSHExecutor, SSHResult
 from remote_workbench.tools import commands, files, git, search, patch, audit as audit_tools
 from remote_workbench.workspace_router import SessionRouter
@@ -32,6 +34,40 @@ async def call(server, thread, name, **arguments):
         return json.loads(blocks[0].text)
     finally:
         request_ctx.reset(token)
+
+
+def test_cached_test_attempt_and_observation_projection_cannot_claim_current_code():
+    saved_observation = {
+        "attempt_id": "a" * 32, "attempt_order": 4, "test_result": "success",
+        "reliable_completion": True, "applies_to_current_code": True,
+        "before": {"digest": "same"}, "after": {"digest": "same"},
+        "observed_at": 123.0,
+    }
+    projected = _public_test_observation(saved_observation)
+    assert projected["applies_to_current_code"] is None
+    assert projected["historical"] is True
+    assert projected["current_code_checked"] is False
+    assert projected["current_applicability"] == "unknown"
+    assert projected["environment_verified_current"] is False
+    assert projected["before"] == saved_observation["before"]
+    assert projected["after"] == saved_observation["after"]
+    assert projected["observed_at"] == 123.0
+    assert saved_observation["applies_to_current_code"] is True  # projection is read-only
+
+    attempt = {
+        "attempt_id": "a" * 32, "attempt_order": 4, "state": "finished",
+        "process_exit_status": "success", "test_result": "success",
+        "before": saved_observation["before"], "after": saved_observation["after"],
+        "observation": saved_observation,
+    }
+    cached = _public_test_attempt(attempt, applicability=None, historical=True)
+    assert cached["applies_to_current_code"] is None
+    assert cached["historical"] is True
+    assert "observation" not in cached
+    fresh = _public_test_attempt(attempt, applicability=True, historical=True)
+    assert fresh["applies_to_current_code"] is True
+    assert fresh["current_applicability"] == "current"
+    assert fresh["historical"] is False
 
 
 def router_at(path):
@@ -291,6 +327,10 @@ async def test_test_then_patch_resume_keeps_result_historical_and_uses_no_ssh(pr
     assert tested["exit_code"] == 0
     assert tested["test_evidence"]["status"] == "passed"
     assert tested["test_evidence"]["applies_to_current_code"] is True
+    assert tested["test_attempt"]["state"] == "finished"
+    assert tested["test_attempt"]["process_exit_status"] == "success"
+    assert tested["test_attempt"]["test_result"] == "success"
+    attempt_id = tested["test_attempt"]["attempt_id"]
 
     current = await call(server, "a", "read_file", path="value.txt")
     assert router.registry.last_test(switched["workspace_id"], switched["target_id"])
@@ -317,10 +357,46 @@ async def test_test_then_patch_resume_keeps_result_historical_and_uses_no_ssh(pr
     assert resumed["last_test"]["historical"] is True
     assert resumed["last_test"]["test_execution_is_historical"] is True
     assert resumed["last_test"]["current_applicability"] == "unknown"
+    assert resumed["latest_test_attempt"]["attempt_id"] == attempt_id
+    assert resumed["latest_test_attempt"]["historical"] is True
+    assert resumed["latest_test_attempt"]["applies_to_current_code"] is None
     compact = create_server(router, tool_profile="compact")
     compact_resume = await call(compact, "a", "workspace_tools", tool="workspace_resume")
     assert compact_resume["last_test"]["applies_to_current_code"] is None
     assert compact_resume["last_test"]["current_applicability"] == "unknown"
+
+
+async def test_test_attempt_is_persisted_before_before_fingerprint_is_read(project, monkeypatch):
+    router, server, source, _ = project
+    switched = await call(server, "a", "workspace_switch", host="a", cwd=str(source))
+    original_capture = test_evidence.capture
+    seen = []
+
+    async def inspect_then_capture(snapshot):
+        attempt = router.registry.latest_test_attempt(switched["workspace_id"], snapshot.target_id)
+        assert attempt is not None
+        assert attempt["state"] == "running"
+        assert attempt["execution_kind"] == "foreground"
+        assert attempt["target"]["target_id"] == snapshot.target_id
+        assert attempt["cwd"] == snapshot.cwd
+        assert attempt["command"] == "python3 -m unittest"
+        if not seen:
+            assert attempt["before"] is None
+        else:
+            assert attempt["before"] is not None
+        seen.append(attempt["attempt_id"])
+        return await original_capture(snapshot)
+
+    monkeypatch.setattr(test_evidence, "capture", inspect_then_capture)
+    result = await call(server, "a", "exec_command", command="python3 -m unittest")
+    assert len(seen) == 2  # before and after snapshots share one durable attempt
+    assert seen[0] == seen[1] == result["test_attempt"]["attempt_id"]
+    assert result["test_attempt"]["state"] == "failed"
+    assert result["test_attempt"]["process_exit_status"] == "failed"
+    assert result["test_attempt"]["test_result"] == "unknown"
+    saved = router.registry.test_attempt(switched["workspace_id"], seen[0])
+    assert saved["before"] is not None and saved["after"] is not None
+    assert router.registry.latest_test_attempt(switched["workspace_id"], switched["target_id"])["attempt_id"] == seen[0]
 
 
 async def test_fresh_snapshot_reassociates_same_code_after_nonmutating_exec(project):
@@ -466,6 +542,7 @@ async def test_rejected_and_authentication_commands_do_not_record_test_evidence(
     assert rejected["executed"] is False
     assert "test_evidence" not in rejected
     assert router.registry.last_test(switched["workspace_id"], switched["target_id"]) is None
+    assert router.registry.latest_test_attempt(switched["workspace_id"], switched["target_id"]) is None
 
     secret_marker = "test-secret-marker"
     auth = await call(server, "a", "exec_command",
@@ -473,6 +550,7 @@ async def test_rejected_and_authentication_commands_do_not_record_test_evidence(
     assert auth["executed"] is False
     assert auth["error"] == "authentication_requires_user_terminal"
     assert "test_evidence" not in auth
+    assert router.registry.latest_test_attempt(switched["workspace_id"], switched["target_id"]) is None
     record = await call(server, "a", "audit_get", operation_id=auth["operation_id"])
     assert secret_marker not in json.dumps(record)
 

@@ -420,8 +420,16 @@ async def ensure(executor, job_id, origin=None):
         if reason:
             return _unknown(job_id, reason)
     info = local_info(executor, job_id)
-    if info.get("error") or info.get("sync_state") == "complete":
+    if info.get("error"):
         return info
+    if info.get("sync_state") == "complete":
+        try:
+            handle = _read_handle(path)
+            from remote_workbench.background_test_evidence import record_collector_event
+            await record_collector_event(executor, handle, info["job_output_id"], complete=True)
+        except (OSError, ValueError, KeyError, json.JSONDecodeError):
+            pass
+        return local_info(executor, job_id)
     tasks = getattr(executor, "_log_collectors", None)
     if tasks is None:
         tasks = executor._log_collectors = {}
@@ -512,6 +520,12 @@ async def _collect(executor, path):
                 audit.update(record_id, **value, synced_at=time.time(),
                     sync_state="complete" if complete else "syncing",
                     status="finished" if complete else "running" if value.get("running") else "unknown")
+                if not complete and value.get("running") is True:
+                    from remote_workbench.background_test_evidence import record_collector_event
+                    await record_collector_event(
+                        executor, handle, record_id, complete=False,
+                        running_verified=True, remote_task=value.get("remote_task"),
+                    )
             else:
                 raise ValueError(value.get("message", "Log follower error"))
         await process.wait()
@@ -520,20 +534,45 @@ async def _collect(executor, path):
         if current.get("sync_state") != "complete":
             audit.update(record_id, sync_state="disconnected", running=None, execution_state="unknown",
                          sync_error=diagnostic or "Log channel closed; task completion is unconfirmed")
+            current = local_info(executor, handle["job_id"])
+        from remote_workbench.background_test_evidence import record_collector_event
+        await record_collector_event(
+            executor, handle, record_id,
+            complete=current.get("sync_state") == "complete",
+            error=current.get("sync_error"),
+        )
     except asyncio.CancelledError:
         if record_id:
             try:
-                audit.update(record_id, sync_state="disconnected", running=None,
-                             execution_state="unknown",
-                             sync_error="Local collection stopped; remote job was not cancelled")
+                current = local_info(executor, handle["job_id"])
+                if current.get("sync_state") != "complete":
+                    audit.update(record_id, sync_state="disconnected", running=None,
+                                 execution_state="unknown",
+                                 sync_error="Local collection stopped; remote job was not cancelled")
+                    current = local_info(executor, handle["job_id"])
+                from remote_workbench.background_test_evidence import record_collector_event
+                await record_collector_event(
+                    executor, handle, record_id,
+                    complete=current.get("sync_state") == "complete",
+                    error=current.get("sync_error"),
+                )
             except (OSError, ValueError):
                 pass
         raise
     except Exception as exc:
         if record_id:
             try:
-                audit.update(record_id, sync_state="disconnected", running=None,
-                             execution_state="unknown", sync_error=str(exc))
+                current = local_info(executor, handle["job_id"])
+                if current.get("sync_state") != "complete":
+                    audit.update(record_id, sync_state="disconnected", running=None,
+                                 execution_state="unknown", sync_error=str(exc))
+                    current = local_info(executor, handle["job_id"])
+                from remote_workbench.background_test_evidence import record_collector_event
+                await record_collector_event(
+                    executor, handle, record_id,
+                    complete=current.get("sync_state") == "complete",
+                    error=current.get("sync_error"),
+                )
             except (OSError, ValueError):
                 # A damaged/unwritable local record still remains non-complete;
                 # never promote it merely because its follower failed.

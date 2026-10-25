@@ -18,6 +18,8 @@ The `remote-workbench-session` entry point (0.3.0a10) provides: persistent works
 
 当前版本提供任务重试去重、独立控制通道、后台日志自动采集、本地等待与搜索、工程基线及交付预览，见[可靠性与权限边界](docs/reliability.zh-CN.md)。stable 只在独立验证后手动推广固定构建；凭证隔离和真实集群验收仍需单独完成。
 
+Develop 的后台任务恢复与测试证据见[后台任务恢复](docs/lifecycle-recovery.zh-CN.md)：丢失启动回复或重启 MCP 后接回原任务；测试尝试与完成观测分别记录，查询历史结果不重新判定当前代码适用性。
+
 ## Work locally and across several servers
 
 Register one MCP named `remote-workbench`. Stable/develop are installation channels; switching channels replaces this entry’s launcher instead of adding another MCP. Routine identity checks use `workspace_info`.

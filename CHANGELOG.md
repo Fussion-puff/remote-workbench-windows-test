@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.0a13 (develop)
+
+- Separate unittest's reported top-level tests and skips. Skipped subtests can make execution/pass counts unknowable; compact replies and HTML use the same facts and retain raw output access.
+- Recover the original background job after a lost launch reply or MCP restart, using persisted target/endpoint/path identity. Reuse one local output handle and collector, continue byte cursors, and preserve unknown states instead of resubmitting commands.
+- Register test attempts before execution and persist collector/recovery observations against the original project. Keep latest attempts, reliable completions and current-code association separate; order records by attempt start and preserve completed historical evidence on repeated reads.
+- Keep process outcomes separate from recognized unittest results. Missing summaries, incomplete fingerprints and unverified dependencies/environments remain explicit; workspace resume stays local-only.
+- Reject authentication commands before job origin/reservation and test-attempt writes, retaining only a redacted refusal audit.
+
 ## 0.3.0a12 (develop)
 
 - Advance contextless saved-log search pages without repeating the same match; preserve overlapping matches and byte budgets.

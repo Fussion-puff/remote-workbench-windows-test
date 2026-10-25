@@ -1,5 +1,14 @@
 # Validation status
 
+## Recoverable background test evidence (0.3.0a13 develop)
+
+- Three behavior commits cover the D1 subTest boundary, C2 recovery of the original background job, and D3 persistent test attempts/collector-driven observations. Direct mode, resource coordination and default-directory changes remain later work.
+- Final full local regression: **538 passed in 142.93 seconds**. The first full run exposed an authentication-refusal ordering regression; the narrow fix passed all 19 authentication checks before the final full rerun. The frozen Python/shell source hashes were unchanged during that successful run.
+- Real MCP stdio subprocess restart with simulated SSH and a real local worker passed: deliberately drop the successful job-start reply after state persistence, restart the controller, bind B, reconnect the original A job, receive partial output before releasing its gate, and persist A's completion without job-status polling. One background launch, stable job/attempt/output identities, byte cursors without duplicate output, and a later foreground result surviving the older background completion were checked.
+- Targeted local worker coverage also includes failed tests, confirmed cancellation, collection disconnect/unknown and reattachment of the same attempt, and an injected SQLite evidence-write failure followed by recovery. Complete stdout/stderr are bounded for summaries; process exit, framework result and code association are separate facts. Historical reads never refresh completed after fingerprints; explicit snapshots compare current code while dependencies/environments remain unverified.
+- Public full/compact input schemas remain unchanged (30/8 tools). Local Python 3.10 and remote-source Python 3.9 syntax checks passed. These are syntax checks; the full run used local Python 3.13. No live IHEP/CERN SSH, actual Codex App loaded-version acceptance, new paid model benchmark, default direct activation or stable promotion was performed.
+- Usage, guarantees and a repeatable local stdio demonstration: [background task recovery](docs/lifecycle-recovery.zh-CN.md). The independent local stable remains 0.3.0a10.
+
 ## First implementation batch (0.3.0a12 develop)
 
 - Five bounded child-agent tasks delivered C1 log pagination, D1 skipped-test summaries, D2 evidence freshness, E1 an offline cost ledger, and the A1/A2 design contract. Parent review requested corrections before integration; direct/copy modes and cross-chat resource locks remain design-only.
