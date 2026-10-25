@@ -77,6 +77,7 @@ class Workspace:
 TOOLS = [
     ("exec_command", commands.ssh_run, "Execute in the remote workspace. Each call starts a fresh default login shell; max_bytes bounds returned output. trace saves expanded commands."),
     ("read_file", files.ssh_read_file, "Read remote UTF-8 lines, numbered, with a SHA256 for guarded edits. offset is zero-based; limit/max_bytes bound output."),
+    ("fetch_image", files.ssh_fetch_image, "Fetch a remote PNG/JPG/PDF/SVG to a private local cache. PDF page is 1-based. Show returned image_markdown in chat; paths and metadata only, no base64. PDF/SVG previews require the local images extra."),
     ("write_file", files.ssh_write_file, "Atomically write remote UTF-8 content. Optional expected_sha256 rejects stale edits."),
     ("patch_file", files.ssh_patch_file, "Apply unique old/new replacements, or sequential edits=[{old,new}], remotely. Optional expected_sha256 and check_only; returns this edit's diff."),
     ("apply_patch", patch.ssh_apply_patch, "Check and apply a unified Git diff remotely. Paths are repository-root relative. check_only previews validation; does not stage or commit."),
@@ -196,6 +197,8 @@ def create_server(workspace: Workspace, *, viewer_url: str | None = None, sessio
         "A cd/export in one call does not change subsequent calls. Explicitly activate "
         "the required environment in the same command. No automatic environment reuse. "
         "Control and audit records stay local; only shell/Python workers run remotely. "
+        "For remote plots use fetch_image and show its image_markdown in chat. "
+        "Do not read image bytes/base64 through text tools; use preview_path with native image viewing only for analysis. "
         "On SSH failure stop and report; never fall back to local project execution. "
         "This is a default directory, not a filesystem sandbox."
         + REVIEW_INSTRUCTIONS

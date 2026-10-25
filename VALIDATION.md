@@ -1,5 +1,13 @@
 # Validation status
 
+## Chat image fetch (0.3.0a8)
+
+- Full local regression suite: 435 tests passed (95.86 seconds).
+- Actual develop MCP stdio acceptance passed for PNG, JPG, SVG and PDF page 2, using a local SSH fixture. Binary originals matched; generated previews opened successfully and the PDF page content was checked.
+- Each MCP reply is one compact text result, measured at 1040–1068 UTF-8 bytes in this fixture, with local paths and chat Markdown rather than binary/base64 payloads. These are byte counts, not tokenizer measurements.
+- Separate chat caches were verified. Missing, non-image, oversized and nonregular files, invalid pages, unavailable renderers, and external/active SVG references are covered. The remote worker still parses as Python 3.9; image rendering libraries run locally.
+- No real server connection or Codex App chat-rendering acceptance was performed. The HTML viewer is unchanged. See [聊天内看图](docs/images.zh-CN.md).
+
 ## Viewer instance isolation (0.3.0a7)
 
 - Full local regression suite: 410 tests passed (92.89 seconds). Targeted viewer/session checks also passed: 40 tests (6.34 seconds).

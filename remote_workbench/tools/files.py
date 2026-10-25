@@ -223,6 +223,21 @@ async def ssh_delete(
 
 
 @mcp.tool()
+async def ssh_fetch_image(path: str, page: int = 1, host: str | None = None) -> dict:
+    """Fetch a remote plot to this chat's private local cache; return paths, never image/base64 data.
+
+    PNG/JPG display directly. PDF (1-based page) and SVG get a local PNG preview
+    when the optional images extra is installed. Show image_markdown in chat;
+    use the native image-view tool on preview_path only when analysis is needed.
+    """
+    from remote_workbench.image_cache import fetch_image
+    if isinstance(page, bool) or not isinstance(page, int) or page < 1:
+        raise ValueError("page must be a positive integer")
+    executor = await require_connection(host)
+    return await fetch_image(executor, path, page)
+
+
+@mcp.tool()
 async def ssh_download(
     remote_path: str,
     local_dir: str = "",

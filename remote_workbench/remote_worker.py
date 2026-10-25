@@ -3,6 +3,7 @@
 Locks coordinate enhanced MCP writers, not arbitrary editors. Hash/stat checks
 detect stale reads; no claim of a transaction against uncooperative processes.
 """
+import base64
 import difflib
 import fcntl
 import hashlib
@@ -143,6 +144,26 @@ def apply_patch(request):
         return {"success": True, "check_only": bool(request.get("check_only")), "summary": summary.stdout.decode("utf-8", "replace"), "patch_sha256": sha(patch)}
 
 
+def read_binary(request):
+    path = Path(request["path"]).expanduser()
+    maximum = request.get("max_file_size", 10485760)
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as source:
+        before = os.fstat(source.fileno())
+        if not stat.S_ISREG(before.st_mode):
+            raise ValueError("Image source must be a regular file")
+        if before.st_size > maximum:
+            raise ValueError("File exceeds configured size limit")
+        data = source.read(maximum + 1)
+        after = os.fstat(source.fileno())
+    if len(data) > maximum:
+        raise ValueError("File exceeds configured size limit")
+    if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+        raise ValueError("File changed while being read; retry after the writer finishes")
+    return {"data_base64": base64.b64encode(data).decode("ascii"),
+            "size": len(data), "sha256": sha(data)}
+
+
 def read_lines(request):
     path = Path(request["path"]).expanduser()
     maximum = request.get("max_file_size", 10485760)
@@ -275,6 +296,8 @@ def main():
             result = apply_patch(request)
         elif request["op"] == "read_lines":
             result = read_lines(request)
+        elif request["op"] == "read_binary":
+            result = read_binary(request)
         else:
             result = edit(request)
     except (OSError, ValueError, UnicodeError, subprocess.SubprocessError) as exc:

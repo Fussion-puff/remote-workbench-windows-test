@@ -47,7 +47,7 @@ jobs:
         run: node --version
 
       - name: Run tests
-        run: uv run --frozen --python "${{ matrix.python-version }}" --extra dev pytest -q
+        run: uv run --frozen --python "${{ matrix.python-version }}" --extra dev --extra images pytest -q
 
   build:
     name: Build package

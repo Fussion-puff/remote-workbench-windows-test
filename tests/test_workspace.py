@@ -42,7 +42,7 @@ def test_manifest_rejects_invalid_bindings(tmp_path, fields):
 async def test_public_schemas_have_no_host_and_optional_cwd(tmp_path):
     workspace = Workspace.load(manifest(tmp_path))
     tools = await create_server(workspace).list_tools()
-    assert len(tools) == 19
+    assert len(tools) == 20
     schemas = {tool.name: tool.inputSchema for tool in tools}
     assert all("host" not in schema["properties"] for schema in schemas.values())
     assert all(tool.outputSchema is None for tool in tools)

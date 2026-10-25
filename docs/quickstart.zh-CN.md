@@ -84,3 +84,7 @@ uv run remote-workbench establish dev --config ~/.config/remote-workbench/config
 工具返回加粗的 **Remote Workbench 操作记录** 链接；打开它查看完整命令、输出和改动。查看页默认使用系统分配的本机端口及本次进程专属地址，因此可与其他项目的 HTML 服务并行。若手动指定的首选端口正被占用，Remote Workbench 会另选空闲端口，不会接管已有页面。MCP 重启后请用新工具结果中的链接；旧链接会失效。后台日志由本地采集器保存，`job_wait` 等待增量，`search_output` 定位错误；完整记录保留在本地，模型按需读取有限片段。
 
 同一 threadId 可在进程重启后恢复绑定；新聊天独立。记录与工程副本是工作流隔离，不是操作系统权限沙箱。合并 MCP 条目不会删除旧日志、旧安装或远端副本。
+
+## 7. 在聊天中看远端图片
+
+选择远端后，可以说“显示 `plots/fit.png`”或“看 `plots/result.pdf` 第 2 页”。Agent 使用 `fetch_image` 获取本地副本并在聊天中显示，不需要打开 HTML。PNG/JPG 可直接展示，PDF/SVG 预览需要本地安装 `images` extra；详见[聊天内看图](images.zh-CN.md)。

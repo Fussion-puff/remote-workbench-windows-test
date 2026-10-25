@@ -39,6 +39,7 @@ _TOOL_TITLES = {
     "ssh_job_status": "查看后台任务",
     "ssh_stop_job": "停止后台任务",
     "ssh_read_file": "查看文件",
+    "ssh_fetch_image": "拉取图片",
     "ssh_write_file": "写入文件",
     "ssh_append_file": "追加文件内容",
     "ssh_insert_lines": "修改文件",

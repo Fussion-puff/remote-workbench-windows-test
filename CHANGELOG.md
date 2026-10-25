@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.0a8 (develop)
+
+- Add `fetch_image` for private local copies of remote PNG/JPG/PDF/SVG files, returning chat image Markdown and paths without binary MCP payloads.
+- Render selected PDF pages and self-contained SVG plots to local PNG previews through the optional `images` extra; retain original files on preview failure.
+- Keep image caches scoped to each chat. The HTML viewer is unchanged.
+
 ## 0.3.0a7 (develop)
 
 - Assign each local audit viewer an OS-selected loopback port by default and a random per-process URL prefix, so other project pages are not reused or overwritten.

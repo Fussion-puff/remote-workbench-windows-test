@@ -34,7 +34,7 @@ _JOB_CONTROL_TOOLS = {"job_status", "stop_job", "job_wait"}
 # Read-only checks and controls must remain available while a foreground
 # command owns the workspace lease. Remote checks may observe intermediate
 # files while a command is running; they never mutate the workspace.
-_READ_ONLY_REMOTE_TOOLS = {"workspace_snapshot", "workspace_changes", "workspace_preview"}
+_READ_ONLY_REMOTE_TOOLS = {"workspace_snapshot", "workspace_changes", "workspace_preview", "fetch_image"}
 _SESSION_LOCAL_TOOLS = {"workspace_resume", "workspace_note"}
 _UNLOCKED_TOOLS = _LOCAL_TOOLS | _JOB_CONTROL_TOOLS | {
     "workspace_info", "workspace_history", "resolve_operation"
@@ -88,6 +88,8 @@ def create_server(router: SessionRouter, *, viewer_url: str | None = None) -> Fa
         "Never fall back to local execution on identity or SSH failure. Relative paths start at the active remote copy. "
         "Every command starts a fresh account-default login shell; activate environments in that command. "
         "No remote Codex CLI runs. Missing MCP threadId stops routing; do not supply an ID as a tool argument. "
+        "For remote plots use fetch_image and show its image_markdown in chat. "
+        "Do not read image bytes/base64 through text tools; use preview_path with native image viewing only for analysis. "
         "Switching resumes existing private targets and preserves old jobs. A fork with a new threadId starts unbound. "
         "For background jobs, pass idempotency_key so a repeated call can recover the same job_id; use "
         "resolve_operation(idempotency_key) after a lost response. Without a key, cross-call retries can start another job. "

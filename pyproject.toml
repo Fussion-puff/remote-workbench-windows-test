@@ -1,6 +1,6 @@
 [project]
 name = "remote-workbench"
-version = "0.3.0a7"
+version = "0.3.0a8"
 description = "Local MCP control for remote SSH workspaces with bounded output and readable audit diffs"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -21,6 +21,11 @@ Issues = "https://github.com/chanfeee/remote-workbench/issues"
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
+]
+images = [
+    "pillow>=10,<13",
+    "pypdfium2>=4,<6",
+    "resvg-py>=0.2,<1",
 ]
 
 [project.scripts]
