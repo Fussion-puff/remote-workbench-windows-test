@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import os
 from pathlib import Path
 import sqlite3
+import json
 from typing import Iterator
 import uuid
 
@@ -30,6 +31,20 @@ class WorkspaceTarget:
     source_cwd: str
     cwd: str | None
     project_root: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class JobOperation:
+    """Persistent idempotency mapping for a requested background job."""
+
+    workspace_id: str
+    idempotency_key: str
+    job_id: str
+    command_fingerprint: str
+    state: str
+    target: WorkspaceTarget
+    created_at: str
+    updated_at: str
 
 
 class RevisionConflict(ValueError):
@@ -115,6 +130,25 @@ class Registry:
                        )"""
                 )
                 db.execute(
+                    """CREATE TABLE IF NOT EXISTS job_operations (
+                           workspace_id TEXT NOT NULL REFERENCES workspaces(workspace_id)
+                               ON DELETE CASCADE,
+                           idempotency_key TEXT NOT NULL,
+                           job_id TEXT NOT NULL,
+                           command_fingerprint TEXT NOT NULL,
+                           target_id TEXT NOT NULL,
+                           host TEXT NOT NULL,
+                           source_cwd TEXT NOT NULL,
+                           cwd TEXT,
+                           project_root TEXT,
+                           state TEXT NOT NULL,
+                           created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                           updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                           PRIMARY KEY(workspace_id, idempotency_key),
+                           UNIQUE(workspace_id, job_id)
+                       )"""
+                )
+                db.execute(
                     "CREATE INDEX IF NOT EXISTS target_history_recent "
                     "ON target_history(workspace_id, revision DESC)"
                 )
@@ -130,6 +164,11 @@ class Registry:
                 db.execute("""CREATE TABLE IF NOT EXISTS last_tests (
                     workspace_id TEXT NOT NULL REFERENCES workspaces(workspace_id), target_id TEXT NOT NULL,
                     observation TEXT NOT NULL, PRIMARY KEY(workspace_id, target_id)
+                )""")
+                db.execute("""CREATE TABLE IF NOT EXISTS workspace_notes (
+                    workspace_id TEXT PRIMARY KEY REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
+                    note TEXT NOT NULL,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 )""")
                 db.commit()
             except BaseException:
@@ -313,6 +352,41 @@ class Registry:
             ).fetchone()
             return self._state(updated)
 
+    def clear_binding(self, workspace_id: str, expected_revision: int) -> WorkspaceState:
+        """Atomically return a thread to its native-local default.
+
+        Only the active binding is cleared. Immutable targets, target history,
+        and job origins remain available for later resume and job control.
+        """
+        if isinstance(expected_revision, bool) or not isinstance(expected_revision, int):
+            raise ValueError("expected_revision must be an integer")
+        with self._transaction() as db:
+            row = db.execute(
+                "SELECT * FROM workspaces WHERE workspace_id = ?", (workspace_id,)
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"Unknown workspace: {workspace_id}")
+            current = self._state(row)
+            if current.revision != expected_revision:
+                raise RevisionConflict(
+                    f"Workspace {workspace_id} revision is {current.revision}, "
+                    f"expected {expected_revision}"
+                )
+            if current.host is None:
+                return current
+            db.execute(
+                """UPDATE workspaces
+                   SET host = NULL, source_cwd = NULL, cwd = NULL,
+                       project_root = NULL, target_id = NULL,
+                       revision = revision + 1, updated_at = CURRENT_TIMESTAMP
+                   WHERE workspace_id = ?""",
+                (workspace_id,),
+            )
+            updated = db.execute(
+                "SELECT * FROM workspaces WHERE workspace_id = ?", (workspace_id,)
+            ).fetchone()
+            return self._state(updated)
+
     def history(self, workspace_id: str, limit: int = 20) -> list[dict]:
         if not isinstance(limit, int) or isinstance(limit, bool) or limit < 0:
             raise ValueError("limit must be a non-negative integer")
@@ -378,6 +452,157 @@ class Registry:
             project_root=row["project_root"],
         )
 
+    def list_jobs(self, workspace_id: str, limit: int | None = None, offset: int = 0) -> list[dict]:
+        """List job handles in newest-registration order with optional pagination.
+
+        The no-argument form remains compatible and returns all jobs for the
+        workspace in job-id order. Paginated requests use newest registration
+        first; rowid preserves insertion order without a schema migration.
+        Every query remains workspace-scoped.
+        """
+        if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit < 0):
+            raise ValueError("limit must be a non-negative integer or None")
+        if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+            raise ValueError("offset must be a non-negative integer")
+        ordering = "rowid DESC" if limit is not None or offset else "job_id"
+        query = f"""SELECT job_id, target_id, workspace_id, host, source_cwd, cwd, project_root
+                    FROM jobs WHERE workspace_id = ? ORDER BY {ordering}"""
+        params: tuple = (workspace_id,)
+        if limit is None:
+            if offset:
+                query += " LIMIT -1 OFFSET ?"
+                params += (offset,)
+        else:
+            query += " LIMIT ? OFFSET ?"
+            params += (limit, offset)
+        with self._connection() as db:
+            rows = db.execute(query, params).fetchall()
+        return [{
+            "job_id": row["job_id"],
+            "target": WorkspaceTarget(
+                target_id=row["target_id"], workspace_id=row["workspace_id"],
+                host=row["host"], source_cwd=row["source_cwd"],
+                cwd=row["cwd"], project_root=row["project_root"],
+            ),
+        } for row in rows]
+
+    @staticmethod
+    def _job_operation(row: sqlite3.Row) -> JobOperation:
+        return JobOperation(
+            workspace_id=row["workspace_id"],
+            idempotency_key=row["idempotency_key"],
+            job_id=row["job_id"],
+            command_fingerprint=row["command_fingerprint"],
+            state=row["state"],
+            target=WorkspaceTarget(
+                target_id=row["target_id"], workspace_id=row["workspace_id"],
+                host=row["host"], source_cwd=row["source_cwd"],
+                cwd=row["cwd"], project_root=row["project_root"],
+            ),
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+    def reserve_job_operation(
+        self, workspace_id: str, idempotency_key: str, target: WorkspaceTarget,
+        job_id: str, command_fingerprint: str,
+    ) -> tuple[JobOperation, bool]:
+        """Atomically bind a key to one target/job before any remote submission.
+
+        The returned boolean is true only for the first reservation. Existing
+        keys with different inputs fail closed; callers must never submit those
+        requests again under a conflicting key.
+        """
+        self._validate_target(workspace_id, target)
+        if not isinstance(idempotency_key, str) or not idempotency_key:
+            raise ValueError("idempotency_key must be non-empty text")
+        if not isinstance(job_id, str) or not job_id:
+            raise ValueError("job_id must be non-empty text")
+        if not isinstance(command_fingerprint, str) or not command_fingerprint:
+            raise ValueError("command_fingerprint must be non-empty text")
+        with self._transaction() as db:
+            workspace = db.execute(
+                "SELECT 1 FROM workspaces WHERE workspace_id = ?", (workspace_id,)
+            ).fetchone()
+            if workspace is None:
+                raise ValueError(f"Unknown workspace: {workspace_id}")
+            existing = db.execute(
+                "SELECT * FROM job_operations WHERE workspace_id = ? AND idempotency_key = ?",
+                (workspace_id, idempotency_key),
+            ).fetchone()
+            target_fields = (target.target_id, target.host, target.source_cwd,
+                             target.cwd, target.project_root)
+            if existing is not None:
+                saved_target = tuple(existing[name] for name in (
+                    "target_id", "host", "source_cwd", "cwd", "project_root"
+                ))
+                if (saved_target != target_fields or
+                        existing["command_fingerprint"] != command_fingerprint):
+                    raise ValueError("idempotency_key is already bound to different job parameters")
+                return self._job_operation(existing), False
+
+            collision = db.execute(
+                "SELECT 1 FROM jobs WHERE workspace_id = ? AND job_id = ?",
+                (workspace_id, job_id),
+            ).fetchone()
+            if collision is not None:
+                raise ValueError("job_id is already registered; use a new idempotency_key")
+            db.execute(
+                """INSERT INTO jobs
+                   (workspace_id, job_id, target_id, host, source_cwd, cwd, project_root)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (workspace_id, job_id, *target_fields),
+            )
+            db.execute(
+                """INSERT INTO job_operations
+                   (workspace_id, idempotency_key, job_id, command_fingerprint,
+                    target_id, host, source_cwd, cwd, project_root, state)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'reserved')""",
+                (workspace_id, idempotency_key, job_id, command_fingerprint, *target_fields),
+            )
+            row = db.execute(
+                "SELECT * FROM job_operations WHERE workspace_id = ? AND idempotency_key = ?",
+                (workspace_id, idempotency_key),
+            ).fetchone()
+            return self._job_operation(row), True
+
+    def get_job_operation(self, workspace_id: str, idempotency_key: str) -> JobOperation:
+        with self._connection() as db:
+            row = db.execute(
+                "SELECT * FROM job_operations WHERE workspace_id = ? AND idempotency_key = ?",
+                (workspace_id, idempotency_key),
+            ).fetchone()
+        if row is None:
+            raise ValueError("Unknown idempotency_key for this workspace")
+        return self._job_operation(row)
+
+    def update_job_operation(self, workspace_id: str, idempotency_key: str, state: str) -> JobOperation:
+        if state not in {"reserved", "submitted", "rejected", "unknown"}:
+            raise ValueError("Invalid job operation state")
+        with self._transaction() as db:
+            cursor = db.execute(
+                """UPDATE job_operations SET state = ?, updated_at = CURRENT_TIMESTAMP
+                   WHERE workspace_id = ? AND idempotency_key = ?""",
+                (state, workspace_id, idempotency_key),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("Unknown idempotency_key for this workspace")
+            row = db.execute(
+                "SELECT * FROM job_operations WHERE workspace_id = ? AND idempotency_key = ?",
+                (workspace_id, idempotency_key),
+            ).fetchone()
+            return self._job_operation(row)
+
+    def reopen_rejected_job_operation(self, workspace_id: str, idempotency_key: str) -> bool:
+        """Permit an explicit retry only after a tool confirmed no execution."""
+        with self._transaction() as db:
+            cursor = db.execute(
+                """UPDATE job_operations SET state = 'reserved', updated_at = CURRENT_TIMESTAMP
+                   WHERE workspace_id = ? AND idempotency_key = ? AND state = 'rejected'""",
+                (workspace_id, idempotency_key),
+            )
+            return cursor.rowcount == 1
+
     def record_call(self, workspace_id, tool, argument_bytes, result_bytes, duration_ms, failed, read_key=None):
         with self._transaction() as db:
             repeated = bool(read_key) and db.execute(
@@ -407,8 +632,47 @@ class Registry:
                 (workspace_id, target_id, json.dumps(observation, separators=(",", ":"))))
 
     def last_test(self, workspace_id, target_id):
-        import json
         with self._connection() as db:
             row = db.execute("SELECT observation FROM last_tests WHERE workspace_id=? AND target_id=?",
                              (workspace_id, target_id)).fetchone()
         return json.loads(row[0]) if row else None
+
+    def workspace_note(self, workspace_id: str, updates: dict | None = None) -> dict | None:
+        """Read or merge a small local recovery note scoped to one workspace."""
+        if updates is None:
+            with self._connection() as db:
+                row = db.execute(
+                    "SELECT note, updated_at FROM workspace_notes WHERE workspace_id = ?",
+                    (workspace_id,),
+                ).fetchone()
+            if row is None:
+                return None
+            return {**json.loads(row["note"]), "updated_at": row["updated_at"]}
+
+        allowed = {"goal", "constraints", "decisions", "next_step"}
+        if not isinstance(updates, dict) or set(updates) - allowed:
+            raise ValueError("workspace note accepts goal, constraints, decisions and next_step")
+        if any(not isinstance(value, str) for value in updates.values()):
+            raise ValueError("workspace note values must be text")
+        with self._transaction() as db:
+            workspace = db.execute(
+                "SELECT 1 FROM workspaces WHERE workspace_id = ?", (workspace_id,)
+            ).fetchone()
+            if workspace is None:
+                raise ValueError(f"Unknown workspace: {workspace_id}")
+            row = db.execute(
+                "SELECT note FROM workspace_notes WHERE workspace_id = ?", (workspace_id,)
+            ).fetchone()
+            note = json.loads(row["note"]) if row else {}
+            note.update(updates)
+            db.execute(
+                """INSERT INTO workspace_notes(workspace_id, note) VALUES (?, ?)
+                   ON CONFLICT(workspace_id) DO UPDATE SET note = excluded.note,
+                       updated_at = CURRENT_TIMESTAMP""",
+                (workspace_id, json.dumps(note, ensure_ascii=False, separators=(",", ":"))),
+            )
+            saved = db.execute(
+                "SELECT note, updated_at FROM workspace_notes WHERE workspace_id = ?",
+                (workspace_id,),
+            ).fetchone()
+            return {**json.loads(saved["note"]), "updated_at": saved["updated_at"]}

@@ -84,10 +84,12 @@ TOOLS = [
     ("find_files", search.ssh_find_files, "Find remote paths by filename glob, type and depth, with bounded results."),
     ("git_status", git.ssh_git_status, "Read remote repository status, including untracked files."),
     ("git_diff", git.ssh_git_diff, "Default compact numstat; mode='patch' returns paged hunks. Continue with output_id/next_cursor to reuse the snapshot."),
-    ("start_job", commands.ssh_run_background, "Start an explicit detached remote job in a fresh default shell. Returns job_id; poll using job_status."),
+    ("start_job", commands.ssh_run_background, "Start a supervised detached job. Optional wait_seconds waits locally for output/exit, then returns the same job_id; wait expiry never cancels the job. Use an idempotency_key in session mode for safe retries."),
     ("job_status", commands.ssh_job_status, "Read detached job state and incremental output. Reuse returned byte cursors."),
+    ("job_wait", commands.ssh_job_wait, "Wait on collector progress or exit without repeated remote-status polling. May start a read-only collector recovery channel; wait expiry does not cancel the job."),
     ("stop_job", commands.ssh_stop_job, "Cancel a supervised job on its originating node. Inspect cleanup_state; remains available when execution is disabled."),
     ("read_output", audit_tools.ssh_read_output, "Page saved output by output_id, stream and byte cursor; full command output and edit diffs are retained locally."),
+    ("search_output", audit_tools.ssh_search_output, "Search saved local output with bounded context and byte cursors; no SSH command."),
     ("audit_get", audit_tools.ssh_audit_get, "Read a local operation record, including actual remote commands and child IDs."),
     ("audit_list", audit_tools.ssh_audit_list, "List recent local operation metadata."),
 ]
@@ -180,8 +182,15 @@ def create_server(workspace: Workspace, *, viewer_url: str | None = None, sessio
     if session is not None:
         workspace = session.workspace
     server = FastMCP("remote-workbench-workspace-" + workspace.name, instructions=(
-        f"Default project environment: {workspace.host}:{workspace.cwd}. "
-        "Use these tools for all project commands, files, search, edits, Git and tests. "
+        "Codex's native local tools always remain available and are never redirected by this MCP. "
+        "Use this MCP only for operations the user explicitly assigns to its configured remote workspace "
+        "in the current chat. Never infer remote intent "
+        "from an existing SSH connection, previous calls, or another chat/session. "
+        f"Configured remote workspace: {workspace.host}:{workspace.cwd}. "
+        "workspace_info reports local metadata by default; set probe=true only when this chat "
+        "explicitly needs to check or prepare the remote workspace. "
+        "Selecting this remote workspace affects only Remote Workbench tools, not all project commands. "
+        "Use these tools for remote files, commands, search, edits, Git and tests only after that explicit selection. "
         "Paths are remote; omitted/relative cwd starts at the workspace root. "
         "A cd/export in one call does not change subsequent calls. Explicitly activate "
         "the required environment in the same command. No automatic environment reuse. "
@@ -200,18 +209,28 @@ def create_server(workspace: Workspace, *, viewer_url: str | None = None, sessio
            if session is not None else "")
     ))
 
-    async def workspace_info() -> dict[str, Any]:
-        """Verify the bound remote directory and default shell; report local control placement."""
+    async def workspace_info(probe: bool = False) -> dict[str, Any]:
+        """Report local configuration metadata; probe SSH and prepare a session copy only when requested."""
         active_workspace = session.workspace if session is not None else workspace
-        connected, message = await active_workspace.executor.check_connection(force=True)
         result = {"name": active_workspace.name, "host": active_workspace.host, "cwd": active_workspace.cwd,
-                  "control": "local", "execution": "remote", "connected": connected,
-                  "shell_state_reused": False, "connection_message": message}
+                  "control": "local", "execution": "remote", "connected": None,
+                  "ready": None, "probe_performed": False, "shell_state_reused": False,
+                  "connection_message": "No remote connection was checked. Use probe=true only when this chat needs remote work."}
         if viewer_url is not None:
             result["viewer_url"] = viewer_url
         if session is not None:
             result.update(source_cwd=source_workspace.cwd, project_isolated=True,
-                          session_id=session.id)
+                          session_id=session.id, session_prepared=bool(session.prepared))
+        if not probe:
+            return result
+
+        if session is not None:
+            await session.ensure_ready()
+            active_workspace = session.workspace
+            result.update(cwd=active_workspace.cwd, session_prepared=bool(session.prepared))
+        result["probe_performed"] = True
+        connected, message = await active_workspace.executor.check_connection(force=True)
+        result.update(connected=connected, connection_message=message)
         if connected:
             probe_code = ('import json,os; print(json.dumps({"cwd":os.getcwd(), '
                           '"shell":os.environ.get("REMOTE_WORKBENCH_LOGIN_SHELL", "")}))')
@@ -229,7 +248,7 @@ def create_server(workspace: Workspace, *, viewer_url: str | None = None, sessio
         return result
 
     server.tool(structured_output=False)(_workspace_response(
-        workspace_info, viewer_url=viewer_url, session=session))
+        workspace_info, viewer_url=viewer_url, session=session, prepare_session=False))
 
     for name, function, description in TOOLS:
         default_max_bytes = {
@@ -242,7 +261,7 @@ def create_server(workspace: Workspace, *, viewer_url: str | None = None, sessio
                          workspace_provider=(lambda: session.workspace) if session is not None else None)
         server.tool(structured_output=False)(_workspace_response(
             tool, default_max_bytes, viewer_url=viewer_url, session=session,
-            prepare_session=name not in {"read_output", "audit_get", "audit_list"}))
+            prepare_session=name not in {"read_output", "search_output", "job_wait", "audit_get", "audit_list"}))
     return server
 
 

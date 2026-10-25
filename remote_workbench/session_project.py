@@ -1,6 +1,7 @@
 """Prepare a private, per-session snapshot of a remote workspace."""
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 
@@ -12,6 +13,7 @@ _SESSION_ID = re.compile(r"^[a-f0-9]{32}$")
 # uses only the standard library and writes into a temporary sibling before
 # atomically publishing the completed project directory.
 _BOOTSTRAP = r'''import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -84,6 +86,83 @@ def atomic_json(path, value):
     finally:
         if os.path.lexists(temporary):
             os.unlink(temporary)
+
+def content_state(root, relative, project_root=None, source_root=None):
+    path = os.path.join(root, relative)
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return {"kind": "missing"}
+    if stat.S_ISLNK(info.st_mode):
+        target = os.readlink(path)
+        if os.path.isabs(target) and project_root and source_root:
+            resolved = os.path.realpath(path)
+            if inside(resolved, source_root):
+                target = os.path.join(project_root, os.path.relpath(resolved, source_root))
+        return {"kind": "symlink", "target": target}
+    if not stat.S_ISREG(info.st_mode):
+        return {"kind": "other"}
+    digest = hashlib.sha256()
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    with os.fdopen(fd, "rb") as source_file:
+        opened = os.fstat(source_file.fileno())
+        if (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns) != (
+                info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns):
+            return {"kind": "unstable"}
+        for block in iter(lambda: source_file.read(1024 * 1024), b""):
+            digest.update(block)
+        current = os.fstat(source_file.fileno())
+    if (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns) != (
+            opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns):
+        return {"kind": "unstable"}
+    current = os.lstat(path)
+    if (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns) != (
+            info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns):
+        return {"kind": "unstable"}
+    return {"kind": "file", "sha256": digest.hexdigest(),
+            "mode": stat.S_IMODE(info.st_mode) & 0o777,
+            "special_mode": bool(info.st_mode & (stat.S_ISUID | stat.S_ISGID | stat.S_ISVTX))}
+
+def directory_file_paths(root):
+    result = []
+    for current, dirs, files in os.walk(root, topdown=True, followlinks=False):
+        relative_dir = os.path.relpath(current, root)
+        if relative_dir == ".":
+            relative_dir = ""
+        kept_dirs = []
+        for name in dirs:
+            relative = os.path.join(relative_dir, name) if relative_dir else name
+            path = os.path.join(current, name)
+            if excluded_from_directory_copy(relative):
+                continue
+            if os.path.islink(path):
+                result.append(relative.replace(os.sep, "/"))
+                continue
+            kept_dirs.append(name)
+        dirs[:] = kept_dirs
+        for name in files:
+            relative = os.path.join(relative_dir, name) if relative_dir else name
+            if not excluded_from_directory_copy(relative):
+                result.append(relative.replace(os.sep, "/"))
+    return sorted(set(result))
+
+def baseline_manifest(source_root, project_root, snapshot_root, source_paths, session_id):
+    files = {}
+    for relative in source_paths:
+        if excluded_from_directory_copy(relative):
+            continue
+        source_before = content_state(source_root, relative, project_root, source_root)
+        project_state = content_state(snapshot_root, relative)
+        source_after = content_state(source_root, relative, project_root, source_root)
+        files[relative] = {"source": source_before, "project": project_state,
+                           "stable_at_copy": source_before == source_after == project_state}
+    value = {"version": 1, "status": "ready", "session_id": session_id,
+             "source_root": source_root, "project_root": project_root,
+             "files": files}
+    value["baseline_id"] = hashlib.sha256(json.dumps(
+        value, sort_keys=True, ensure_ascii=True, separators=(",", ":")
+    ).encode("utf-8")).hexdigest()
+    return value
 
 def copy_file(source, target, source_root, target_root):
     os.makedirs(os.path.dirname(target), mode=0o700, exist_ok=True)
@@ -198,6 +277,7 @@ def main():
         os.chmod(parent, 0o700)
 
     marker_path = os.path.join(parent, "session.json")
+    baseline_path = os.path.join(parent, "baseline.json")
     lock_path = os.path.join(parent, ".prepare.lock")
     lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600)
     temporary = None
@@ -222,6 +302,13 @@ def main():
             if not os.path.isdir(destination) or os.path.islink(destination):
                 fail("prepared session project is missing or is not a directory", "reuse project")
             result = dict(metadata)
+            baseline = read_marker(baseline_path)
+            result["baseline_available"] = bool(
+                baseline and baseline.get("version") == 1
+                and baseline.get("session_id") == session_id
+                and baseline.get("project_root") == destination
+                and baseline.get("baseline_id") == metadata.get("baseline_id")
+            )
             result["created"] = False
             print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
             return
@@ -231,9 +318,19 @@ def main():
                 fail("destination already exists; refusing to overwrite", "reserve destination")
             # Atomic rename completed before an interrupted metadata update.
             metadata["status"] = "ready"
+            baseline = read_marker(baseline_path)
+            if (baseline and baseline.get("version") == 1
+                    and baseline.get("session_id") == session_id
+                    and baseline.get("project_root") == destination):
+                metadata["baseline_id"] = baseline.get("baseline_id")
+                metadata["baseline_file_count"] = len(baseline.get("files", {}))
+            else:
+                metadata.pop("baseline_id", None)
+                metadata["baseline_file_count"] = 0
             metadata.pop("error", None)
             atomic_json(marker_path, metadata)
             result = dict(metadata)
+            result["baseline_available"] = bool(metadata.get("baseline_id"))
             result["created"] = False
             print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
             return
@@ -282,6 +379,7 @@ def main():
             remotes = {}
             if inside(destination, source):
                 fail("destination must be outside the source workspace", "validate destination")
+            source_paths = directory_file_paths(repo_root)
 
         cwd = destination if relative_cwd in (".", "") else os.path.normpath(os.path.join(destination, relative_cwd))
         metadata.update({"project_type": project_type, "source_root": repo_root,
@@ -307,6 +405,8 @@ def main():
             entries = checked(["git", "-C", repo_root, "ls-files", "--full-name",
                                "--cached", "--others", "--exclude-standard", "-z"], stage="list source files")
             paths = sorted(set(os.fsdecode(path) for path in entries.split(b"\0") if path))
+            source_paths = [path for path in paths
+                            if not excluded_from_directory_copy(path)]
             tracked = checked(["git", "-C", repo_root, "ls-files", "--full-name", "--cached", "-z"], stage="list tracked files")
             tracked_paths = set(os.fsdecode(item) for item in tracked.split(b"\0") if item)
             skip = [path for path in tracked_paths if tool_owned(path)]
@@ -326,15 +426,20 @@ def main():
         else:
             copy_tree(repo_root, temporary, repo_root, destination)
 
+        baseline = baseline_manifest(repo_root, destination, temporary, source_paths, session_id)
         os.chmod(temporary, 0o700)
         if os.path.lexists(destination):
             fail("destination appeared during preparation; refusing to overwrite", "publish project")
         os.rename(temporary, destination)
         temporary = None
+        atomic_json(baseline_path, baseline)
+        metadata["baseline_id"] = baseline["baseline_id"]
+        metadata["baseline_file_count"] = len(baseline["files"])
         metadata["status"] = "ready"
         metadata.pop("error", None)
         atomic_json(marker_path, metadata)
         result = dict(metadata)
+        result["baseline_available"] = True
         result["created"] = True
         print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
     except Exception as exc:

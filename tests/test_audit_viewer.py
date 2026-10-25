@@ -77,6 +77,28 @@ def test_parent_record_uses_validated_child_output_and_display_metadata(audit_ht
     assert output["content"].startswith("@@ -1 +1 @@")
 
 
+def test_background_submission_view_uses_job_state_not_start_record(tmp_path, monkeypatch):
+    monkeypatch.setenv("REMOTE_WORKBENCH_AUDIT_DIR", str(tmp_path / "audit"))
+    parent = audit.create(kind="tool", tool="ssh_run_background", status="finished",
+                          arguments={"command": "make test"})
+    job = audit.create(kind="job", parent_id=parent, status="running", running=True,
+                       execution_state="running", sync_state="syncing", exit_code=None,
+                       command="make test", job_id="job-1")
+    audit.add_child(parent, job)
+    audit.update(parent, output_id=job)
+
+    record, source_id = Handler._record_view(parent)
+    assert source_id == job
+    assert record["status"] == "running"
+    assert record["view"]["state"] == "running"
+    assert record["view"]["sync_state"] == "syncing"
+
+    audit.update(job, status="finished", running=False, execution_state="finished",
+                 sync_state="complete", exit_code=23)
+    record, _ = Handler._record_view(parent)
+    assert record["view"]["state"] == "failed"
+
+
 @pytest.mark.parametrize("child_id", ["../outside", "a" * 32])
 def test_parent_ignores_invalid_or_missing_output_child(audit_http, child_id):
     client, base = audit_http

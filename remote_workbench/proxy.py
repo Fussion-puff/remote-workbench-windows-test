@@ -184,6 +184,9 @@ class WorkbenchSSHSession(asyncssh.SSHServerSession):
             "-S", cp,
             "-o", "ControlMaster=no",
             "-o", "BatchMode=yes",
+            # If the saved master socket is missing, make fallback connection
+            # impossible instead of allowing SSH to authenticate afresh.
+            "-o", "ProxyCommand=false",
         ]
         if self._cfg.port != 22:
             argv += ["-p", str(self._cfg.port)]

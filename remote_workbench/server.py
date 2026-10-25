@@ -12,6 +12,7 @@ from remote_workbench import audit
 from remote_workbench.config import get_config, HostConfig
 from remote_workbench.ssh import SSHExecutor
 from remote_workbench.compute_review import REVIEW_INSTRUCTIONS
+from remote_workbench.auth_boundary import authentication_command, refusal
 
 class AuditedMCP(FastMCP):
     def tool(self, *args, **kwargs):
@@ -20,9 +21,15 @@ class AuditedMCP(FastMCP):
             @functools.wraps(function)
             async def call(*a, **kw):
                 # Reading audit records should not generate recursive audit noise.
-                if function.__name__ in {"ssh_read_output", "ssh_audit_list", "ssh_audit_get"}:
+                if function.__name__ in {"ssh_read_output", "ssh_search_output", "ssh_job_status", "ssh_job_wait", "ssh_audit_list", "ssh_audit_get"}:
                     return await function(*a, **kw)
                 bound = inspect.signature(function).bind(*a, **kw)
+                if (function.__name__ in {"ssh_run", "ssh_run_background"}
+                        and authentication_command(bound.arguments.get("command", ""))):
+                    record_id = audit.create(kind="tool", tool=function.__name__,
+                        arguments={"command": "[authentication arguments omitted]"}, status="failed",
+                        error="authentication_requires_user_terminal")
+                    return dict(refusal(), operation_id=record_id)
                 record_id = audit.create(kind="tool", tool=function.__name__, arguments=dict(bound.arguments),
                                          host=bound.arguments.get("host"), cwd=bound.arguments.get("cwd"), status="running")
                 token = audit.operation_id.set(record_id)

@@ -22,6 +22,14 @@ _STATE_LABELS = {
 }
 
 _TOOL_TITLES = {
+    "workspace_resume": "恢复工作进度",
+    "workspace_note": "保存工作要点",
+    "workspace_changes": "查看本会话改动",
+    "workspace_preview": "预览交付改动",
+    "workspace_apply": "交付已审阅改动",
+    "resolve_operation": "恢复原任务句柄",
+    "ssh_job_wait": "等待任务进展",
+    "ssh_search_output": "搜索已保存输出",
     "workspace_snapshot": "查看工程快照",
     "session_identity_probe": "检查对话身份",
     "workspace_switch": "切换工作区",
@@ -113,6 +121,8 @@ def _tool_operation(tool: str, args: dict) -> str:
 
 def _status(record: dict, source: dict) -> str:
     """Resolve state with explicit tool/patch errors and exit codes first."""
+    if source.get("kind") == "job":
+        return _status(source, {})
     status = _first(record.get("status"), source.get("status")).lower()
     execution_state = _first(record.get("execution_state"), source.get("execution_state")).lower()
     patch_result = _first(record.get("patch_result"), source.get("patch_result")).lower()
@@ -127,6 +137,8 @@ def _status(record: dict, source: dict) -> str:
         return "timeout"
     if record.get("timed_out") or source.get("timed_out"):
         return "timeout"
+    if execution_state in {"unknown", "remote_state_unknown", "cancellation_requested"}:
+        return "unknown"
     if status in {"starting", "running"}:
         return "running"
     if isinstance(exit_code, int) and exit_code != 0:
@@ -240,7 +252,7 @@ def summarize_record(record: dict, source_record: dict | None = None) -> dict:
     workspace = posixpath.basename(path.rstrip("/")) if path.rstrip("/") else ("/" if path == "/" else "未指定")
     state = _status(record, source)
     elapsed = _elapsed(record, source)
-    return {
+    view = {
         "title": _title(record, source, tool, args),
         "state": state,
         "state_label": _STATE_LABELS[state],
@@ -250,6 +262,13 @@ def summarize_record(record: dict, source_record: dict | None = None) -> dict:
         "elapsed": elapsed,
         "command": _display_command(record, source, tool, args),
     }
+    job = source if source.get("kind") == "job" else record
+    if job.get("kind") == "job":
+        sync = job.get("sync_state", "unknown")
+        view["sync_state"] = sync
+        view["sync_label"] = {"queued": "日志等待同步", "syncing": "日志同步中",
+                              "complete": "日志已同步", "disconnected": "日志同步断开，任务状态待核实"}.get(sync, "日志同步状态未知")
+    return view
 
 
 def _record_exit_code(record: dict) -> int | None:
@@ -277,7 +296,9 @@ def summarize_output(text: str, record: dict, stream: str, complete: bool = Fals
     exit_code = _record_exit_code(record)
     if record.get("timed_out") or source.get("timed_out"):
         return None
-    if record.get("status") in {"running", "starting", "timeout", "cancelled"}:
+    if (record.get("status") in {"running", "starting", "timeout", "cancelled", "unknown"}
+            or record.get("execution_state") in {"unknown", "remote_state_unknown", "cancellation_requested"}
+            or source.get("execution_state") in {"unknown", "remote_state_unknown", "cancellation_requested"}):
         return None
     if _contains_error(record) and not _UNITTEST_SUMMARY.search(text):
         return None

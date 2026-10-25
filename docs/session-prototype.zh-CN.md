@@ -1,6 +1,6 @@
 # 按 Codex 对话路由的 Session 原型
 
-`remote-workbench-session` 从 `0.3.0a1` 起作为 develop 的可选入口，当前版本为 `0.3.0a5`。它复用原有 SSH、文件、Git 和后台任务工具，保留 `remote-workbench-workspace` 与 `remote-workbench-ssh`。安装到独立 wheel 环境的日常版不会随开发源码改变。
+`remote-workbench-session` 从 `0.3.0a1` 起作为 develop 的可选入口，当前版本为 `0.3.0a6`。它复用原有 SSH、文件、Git 和后台任务工具，保留 `remote-workbench-workspace` 与 `remote-workbench-ssh`。安装到独立 wheel 环境的日常版不会随开发源码改变。
 
 `0.3.0a5` 增加前后台任务的独立监督、进程组清理、`stop_job` 和独立清理命令。大量计算由 Agent 展示命令、并发规模和环境，等待用户明确确认后启动；普通工程操作直接执行，不要求 cgroup 或统一进程数上限。适用范围与实际清理边界见[计算审核与任务生命周期](process-safety.zh-CN.md)。本轮仅进行了本地受控测试，尚未做集群验收，也未替换 stable。
 
@@ -26,12 +26,13 @@ workspace_switch(host="myserver", cwd="/absolute/path/to/project")
 | --- | --- |
 | `workspace_info()` | 读取当前绑定、revision、身份来源及允许的主机，不执行 SSH |
 | `workspace_switch(host, cwd, expected_revision=None)` | 验证目标、创建或恢复私有副本，然后原子切换 |
+| `workspace_use_local(expected_revision=None)` | 仅清除当前聊天的活动远端绑定；保留副本、目标历史和作业来源 |
 | `workspace_history(limit=20)` | 读取本对话的目标切换历史，最新在前 |
 | `workspace_snapshot()` | 一次读取当前 Git 概况、本目标的历史测试证据及通信计量 |
 
 切换失败时，原绑定保持不变。`expected_revision` 可拒绝基于过时状态的切换。切回相同主机和规范化模板路径会恢复已保存的副本，不重新覆盖代码；重复选择当前目标是幂等操作。已保存目录消失或发生重定位时会报错，不会静默从模板重建。
 
-每次执行使用不可变快照。每个工作区的本机文件锁会串行化前台调用和目标切换，同一数据目录下的不同 MCP 进程也遵守该锁；等待超过 30 秒会提示当前存在前台操作。不同工作区可以并行。
+每次执行使用不可变快照。每个工作区的本机文件锁会串行化普通工程操作和目标切换，同一数据目录下的不同 MCP 进程也遵守该锁；等待超过 30 秒会提示当前存在前台操作。停止任务、状态、等待及本地记录读取不经过该长操作锁。不同工作区可以并行。
 
 后台任务另存提交时的目标。切换后，`job_status(job_id)` 仍访问原服务器及原状态目录。job ID 在同一工作区内不能重新绑定到其他目标，不同工作区可以使用同名 job ID。SSH 提交结果不明时也保留原始目标，避免重试时误投递至另一台服务器。
 
@@ -148,3 +149,7 @@ args = ["--identity-probe", "--data-dir", "/absolute/path/to/develop/identity-da
 第一阶段成功而第二阶段缺失时，按 [官方配置步骤](https://learn.chatgpt.com/docs/extend/mcp#configure-in-the-chatgpt-desktop-app)在保存设置后选择 Restart，再回到原对话检查。单独启动 CLI 或 Python MCP 客户端可以检查配置、协议和服务实现，但不能证明当前 App 对话已经获得工具或转发身份。
 
 App Server 的公开 `config/mcpServer/reload` 接口可为已加载对话排队刷新配置，但需要已有、受支持的服务连接。仅通过 stdio 启动的桌面实例不一定提供 CLI 可接入的控制端口；此时按 App 的重启流程处理。
+
+## Develop：任务恢复、日志和交付
+
+当前工作树新增了任务幂等键、独立控制通道、稳定本地作业输出、后台采集、`job_wait`/`search_output`、`workspace_resume` 及基于实际复制基线的交付工具。使用方式、冲突规则、测试证据局限和凭证访问边界集中说明于[可靠性与权限边界](reliability.zh-CN.md)。这一轮验证限定为本机模拟；不会因源码修改而切换已安装的 stable 或启用真实远端执行。

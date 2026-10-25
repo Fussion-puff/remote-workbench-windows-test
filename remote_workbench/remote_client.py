@@ -56,4 +56,9 @@ async def edit(executor, payload, cwd=None, max_bytes=8192, timeout=None):
         audit.update(result.output_id, diff_kind="edit_preview" if payload.get("check_only") else "file_edit")
         value["diff"], value["diff_truncated"] = audit.preview(data, max_bytes)
     value["output_id"] = result.output_id
+    if payload.get("op") == "job_start" and value.get("job_dir") and not value.get("error"):
+        local = await executor.track_job(value, payload["command"], cwd or executor.config.default_cwd)
+        value.update(local)
+        value["launch_output_id"] = result.output_id
+        value["output_id"] = value["job_output_id"]
     return value

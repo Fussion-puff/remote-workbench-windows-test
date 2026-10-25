@@ -171,3 +171,22 @@ def test_partial_diff_is_marked_and_non_diff_or_combined_diff_is_omitted():
     assert partial["added"] == 1 and partial["deleted"] == 1
     assert parse_unified_diff("ordinary command output\n", complete=True) is None
     assert parse_unified_diff("diff --git a/a b/a\n@@@ -1 +1 @@@\n", complete=True) is None
+
+
+def test_background_submission_success_does_not_mean_job_completed():
+    parent = {'tool': 'ssh_run_background', 'status': 'finished', 'arguments': {'command': 'sleep 1'}}
+    job = {'kind': 'job', 'status': 'running', 'running': True, 'sync_state': 'syncing'}
+    view = summarize_record(parent, job)
+    assert view['state'] == 'running'
+    assert view['sync_label'] == '日志同步中'
+    job.update(status='unknown', running=None, sync_state='disconnected', execution_state='unknown')
+    view = summarize_record(parent, job)
+    assert view['state'] == 'unknown'
+    assert '待核实' in view['sync_label']
+
+
+def test_unknown_cleanup_does_not_become_success_from_zero_exit_or_test_footer():
+    record = {'kind': 'job', 'status': 'finished', 'exit_code': 0,
+              'execution_state': 'unknown', 'sync_state': 'complete'}
+    assert summarize_record(record)['state'] == 'unknown'
+    assert summarize_output('Ran 1 test in 0.001s\n\nOK\n', record, 'stdout', complete=True) is None

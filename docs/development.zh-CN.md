@@ -90,3 +90,22 @@ env = { REMOTE_WORKBENCH_AUDIT_DIR = "/absolute/path/to/opt/remote-workbench/dev
 Develop 的 `0.3.0a1` 增加了 `remote-workbench-session`。它使用请求 metadata 中的 threadId 和本机 SQLite Registry，支持跨进程恢复及主机/模板切换，同时保留每个对话的私有远端工程副本。它使用单独的 `--data-dir`，首次工作区未绑定；不会继承固定 workspace manifest 的默认目标。详见 [Session 原型](session-prototype.zh-CN.md)。
 
 启用开发原型前，需要在实际客户端验证 `_meta.threadId`；SDK 测试客户端主动传入 metadata 的成功结果不能代替这一检查。当前日常稳定版无需切换或升级。
+
+## `0.3.0a6` 起的混合工作入口与推广顺序
+
+本地和多个服务器协作时，使用 `remote-workbench-session`，不再将固定 `--workspace` 入口作为所有聊天的默认远端环境。日常 MCP 可保持可见，但每个新 thread 都从本地模式开始；需要远端时显式选择配置中的主机和绝对源目录。本地命令始终使用本地工具，远端选择只影响 Remote Workbench 工具；`workspace_use_local` 可清除当前绑定并保留原任务和副本。
+
+固定 workspace 入口仍可供明确选择单个远端模板的旧流程使用。其 `workspace_info()` 现在仅查看本地配置；`probe=true` 才检查远端，避免为了查看信息而准备目录。
+
+推广顺序是：develop 通过本机回归与隔离 wheel 验收后提交、推送；再从该固定提交的 wheel 创建新的 stable release、验证安装来源与默认本地行为，最后手动切换日常启动器。stable 不使用 editable 安装，不因 develop 的后续修改自动更新；没有自动定时升级。真实集群测试与本机模拟验收分开记录。
+
+日常入口示例：
+
+```toml
+[mcp_servers.remote-workbench-stable]
+command = "/absolute/path/to/stable/releases/VERSION-COMMIT/venv/bin/remote-workbench-session"
+args = ["--config", "/absolute/path/to/stable/hosts.yaml", "--data-dir", "/absolute/path/to/stable/session-data", "--viewer-port", "8768"]
+enabled = true
+```
+
+`hosts.yaml` 提供可选主机，不设置自动绑定的模板；`--data-dir` 与 develop 分开。旧固定 workspace 的进程 UUID 没有可信 threadId 映射，因此旧副本和记录保留，但不会静默转成新聊天的默认远端绑定。缺少 threadId 时新入口拒绝远端路由，不能回退到固定默认服务器。更换启动器后重载 App 的 MCP，再在新聊天验证 `workspace_info.mode=local`。

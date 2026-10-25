@@ -7,7 +7,7 @@ import yaml
 
 from remote_workbench.config import HostConfig
 from remote_workbench.server import get_executor, require_connection, workspace_executor
-from remote_workbench.ssh import SSHExecutor
+from remote_workbench.ssh import SSHExecutor, SSHResult
 from remote_workbench.tools import commands, files, git, search, patch
 from remote_workbench.workspace import Workspace, bind_tool, create_server
 
@@ -42,7 +42,7 @@ def test_manifest_rejects_invalid_bindings(tmp_path, fields):
 async def test_public_schemas_have_no_host_and_optional_cwd(tmp_path):
     workspace = Workspace.load(manifest(tmp_path))
     tools = await create_server(workspace).list_tools()
-    assert len(tools) == 17
+    assert len(tools) == 19
     schemas = {tool.name: tool.inputSchema for tool in tools}
     assert all("host" not in schema["properties"] for schema in schemas.values())
     assert all(tool.outputSchema is None for tool in tools)
@@ -107,3 +107,33 @@ async def test_no_local_execution_fallback_when_disconnected(tmp_path):
         await invoke(command="touch must-not-exist")
     workspace.executor.run.assert_not_awaited()
     assert workspace_executor.get() is None
+
+
+async def test_workspace_info_is_local_metadata_unless_probe_is_requested(tmp_path):
+    workspace = Workspace("test", "remote", "/remote/project", SSHExecutor(HostConfig(ssh_host="server")))
+    workspace.executor.check_connection = AsyncMock(side_effect=AssertionError("unexpected SSH check"))
+    workspace.executor.run_program = AsyncMock(side_effect=AssertionError("unexpected SSH command"))
+    server = create_server(workspace)
+
+    # MCP discovery and default metadata inspection are entirely local.
+    assert await server.list_tools()
+    result = json.loads((await server.call_tool("workspace_info", {}))[0].text)
+    assert result["host"] == "remote"
+    assert result["cwd"] == "/remote/project"
+    assert result["probe_performed"] is False
+    assert result["connected"] is None
+    workspace.executor.check_connection.assert_not_awaited()
+    workspace.executor.run_program.assert_not_awaited()
+
+    # A probe only touches mocked local methods when explicitly requested.
+    workspace.executor.check_connection = AsyncMock(return_value=(True, "connected"))
+    workspace.executor.run_program = AsyncMock(return_value=SSHResult(
+        stdout='{"cwd":"/remote/project","shell":"/bin/bash"}', stderr="", exit_code=0,
+        output_id="probe-output",
+    ))
+    result = json.loads((await server.call_tool("workspace_info", {"probe": True}))[0].text)
+    assert result["probe_performed"] is True
+    assert result["connected"] is True
+    assert result["ready"] is True
+    workspace.executor.check_connection.assert_awaited_once_with(force=True)
+    workspace.executor.run_program.assert_awaited_once()

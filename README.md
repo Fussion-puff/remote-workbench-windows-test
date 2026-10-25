@@ -8,11 +8,17 @@ This is an independently maintained derivative of [Onirika](https://github.com/x
 
 本机开发环境与日常稳定版的隔离、安装和切换方式见[开发与稳定版部署](docs/development.zh-CN.md)。
 
-Develop also includes an opt-in `remote-workbench-session` prototype (0.3.0a5): persistent workspaces routed by MCP `_meta.threadId`, atomic host/directory switching, jobs pinned to their original targets and checked against node/process identity, explicit project snapshots, and measured response bytes. Each thread keeps its own remote project copies. An identity-only diagnostic is available before enabling remote tools. This does not change an independently installed stable release; see [Session 原型与客户端联调边界](docs/session-prototype.zh-CN.md).
+Develop also includes an opt-in `remote-workbench-session` prototype (0.3.0a6): persistent workspaces routed by MCP `_meta.threadId`, atomic host/directory switching, jobs pinned to their original targets and checked against node/process identity, explicit project snapshots, and measured response bytes. Each thread keeps its own remote project copies. An identity-only diagnostic is available before enabling remote tools. This does not change an independently installed stable release; see [Session 原型与客户端联调边界](docs/session-prototype.zh-CN.md).
+
+Develop 的改进包括任务重试去重、独立控制通道、后台日志自动采集、本地等待与搜索、工程基线及交付预览，见[可靠性与权限边界](docs/reliability.zh-CN.md)。stable 只在独立验证后手动推广固定构建；凭证隔离和真实集群验收仍需单独完成。
+
+## Work locally and across several servers
+
+For mixed local and remote projects, use `remote-workbench-session`. Each new chat starts in local mode; tool discovery and `workspace_info` do not contact SSH. Use native local tools for local commands, choose a remote host and source directory with `workspace_switch`, and use `workspace_use_local` to clear that chat's active remote binding. Choosing a server does not redirect all project commands. Existing jobs stay attached to their original server when you switch, and other chats keep independent targets. See [本地与多服务器协作](docs/reliability.zh-CN.md#同一项目的本地与多服务器协作).
 
 ## Use a remote project as the default environment
 
-The recommended entry point, `remote-workbench-workspace`, binds one local MCP process to a host and an absolute remote template directory. Its tools omit the host parameter and resolve relative paths from that process's private project copy. Copy [workspace.example.json](workspace.example.json), then set `host` to an alias from your local SSH configuration and `cwd` to the remote project template.
+The fixed-workspace entry point, `remote-workbench-workspace`, binds one local MCP process to a host and an absolute remote template directory. Its tools omit the host parameter and resolve relative paths from that process's private project copy. Copy [workspace.example.json](workspace.example.json), then set `host` to an alias from your local SSH configuration and `cwd` to the remote project template.
 
 The workspace starts the remote account's configured login shell for each call, using that shell's own login and interactive startup files. No particular shell, including zsh, is required. Foreground commands and detached jobs use the same selection. Write commands and any preamble in the remote shell's syntax. A directory change, environment variable, or activated Conda/venv environment does not persist into the next call; activate the environment in each command that needs it.
 

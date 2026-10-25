@@ -173,3 +173,14 @@ class SessionRouter:
             if actual != target.cwd:
                 raise ValueError("Saved workspace directory changed; refusing implicit relocation")
         return self.registry.commit_switch(state.workspace_id, expected, target)
+
+    def use_local(self, state: WorkspaceState, expected_revision: int | None = None):
+        """Clear the active remote binding without contacting any host.
+
+        The caller holds the workspace lease. The registry performs a second
+        revision check in the same transaction that clears the binding.
+        """
+        expected = state.revision if expected_revision is None else expected_revision
+        if isinstance(expected, bool) or not isinstance(expected, int) or expected != state.revision:
+            raise RevisionConflict("Workspace revision changed; inspect workspace_info before retrying")
+        return self.registry.clear_binding(state.workspace_id, expected)

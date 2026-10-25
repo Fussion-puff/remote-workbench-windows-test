@@ -49,6 +49,22 @@ class SSHExecutor:
         self._last_check: float = 0.0
         self._last_check_ok: bool = False
 
+    def job_local_info(self, job_id: str) -> dict:
+        from remote_workbench.job_collector import local_info
+        return local_info(self, job_id)
+
+    async def ensure_job_collection(self, job_id: str) -> dict:
+        from remote_workbench.job_collector import ensure
+        return await ensure(self, job_id)
+
+    async def track_job(self, result: dict, command: str, cwd: str) -> dict:
+        from remote_workbench.job_collector import track
+        return await track(self, result, command, cwd)
+
+    async def close_collectors(self):
+        from remote_workbench.job_collector import close
+        await close(self)
+
     async def check_connection(self, force: bool = False) -> tuple[bool, str]:
         """Verify the ControlMaster socket is alive.
 

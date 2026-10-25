@@ -163,6 +163,7 @@ main{display:grid;grid-template-columns:minmax(250px,310px) minmax(0,1fr);height
     if (elapsed) { if (workspace || host) context.append(make('span','separator','·')); context.append(make('span','',elapsed)); }
     const when = formatTime(record.created_at);
     if (when) { if (workspace || host || elapsed) context.append(make('span','separator','·')); context.append(make('span','',when)); }
+    if (view.sync_label) { context.append(make('span','separator','·')); context.append(make('span','',view.sync_label)); }
   }
   function showSummary(target, summary) {
     const prefix = target === 'output' ? 'output-' : '';
@@ -552,6 +553,9 @@ class Handler(BaseHTTPRequestHandler):
                     if child.get("parent_id") == record_id:
                         source_id = child_id
                         source_record = child
+                        if child.get("kind") == "job":
+                            for key in ("status", "execution_state", "running", "remote_task", "sync_state"):
+                                record[key] = child.get(key)
                         for key in ("actual_cwd", "exit_code", "diff_kind", "check_only", "patch_result", "wrapped_command"):
                             if key not in record and key in child:
                                 record[key] = child[key]

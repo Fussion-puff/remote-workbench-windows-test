@@ -155,6 +155,9 @@ def test_build_argv_subsystem_form(host_config):
     assert "-tt" not in argv  # no PTY for a subsystem
     assert argv[0] == "ssh"
     assert "ControlMaster=no" in argv
+    assert argv[argv.index("-o") + 1] == "ControlMaster=no"
+    proxy_command_index = argv.index("ProxyCommand=false")
+    assert argv[proxy_command_index - 1:proxy_command_index + 1] == ["-o", "ProxyCommand=false"]
 
 
 def test_build_argv_exec_has_no_subsystem(host_config):
@@ -163,6 +166,27 @@ def test_build_argv_exec_has_no_subsystem(host_config):
     argv = session._build_argv()
     assert "-s" not in argv
     assert argv[-1] == "ls"
+    proxy_command_index = argv.index("ProxyCommand=false")
+    assert argv[proxy_command_index - 1:proxy_command_index + 1] == ["-o", "ProxyCommand=false"]
+
+
+@pytest.mark.parametrize("route", ["shell", "exec", "pty", "subsystem"])
+def test_all_ssh_gateway_routes_disable_fresh_connection_fallback(host_config, route):
+    session = WorkbenchSSHSession(host_config)
+    if route == "shell":
+        session._command = None
+    elif route == "exec":
+        session._command = "true"
+    elif route == "pty":
+        session._want_pty = True
+        session._command = "true"
+    else:
+        session._subsystem = "sftp"
+
+    argv = session._build_argv()
+    assert argv.count("ProxyCommand=false") == 1
+    proxy_command_index = argv.index("ProxyCommand=false")
+    assert argv[proxy_command_index - 1:proxy_command_index + 1] == ["-o", "ProxyCommand=false"]
 
 
 async def test_subsystem_bridges_like_exec(host_config, keys, monkeypatch):

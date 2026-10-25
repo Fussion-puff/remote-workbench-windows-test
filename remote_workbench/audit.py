@@ -104,16 +104,23 @@ def open_stream(record_id: str, stream: str):
     return open(directory(record_id) / stream, "wb", opener=lambda p, f: os.open(p, f, 0o600))
 
 
-def read_output(record_id: str, stream="stdout", cursor=0, max_bytes=8192) -> dict:
+def read_output(record_id: str, stream="stdout", cursor=0, max_bytes=8192, max_lines=None) -> dict:
     if stream not in STREAMS:
         raise ValueError("Unknown stream")
     cursor, max_bytes = int(cursor), int(max_bytes)
     if cursor < 0 or not 4 <= max_bytes <= 65536:
         raise ValueError("cursor >= 0 and 4 <= max_bytes <= 65536 required")
+    if max_lines is not None and (not isinstance(max_lines, int) or isinstance(max_lines, bool) or
+                                  not 1 <= max_lines <= 1000):
+        raise ValueError("1 <= max_lines <= 1000 required")
     path = directory(record_id) / stream
     with path.open("rb") as source:
         source.seek(cursor)
         data = source.read(max_bytes)
+    if max_lines is not None:
+        lines = data.splitlines(keepends=True)
+        if len(lines) > max_lines:
+            data = b"".join(lines[:max_lines])
     # Preserve UTF-8 boundaries when reading the next page.
     text = data.decode("utf-8", errors="replace")
     if len(data) == max_bytes:
